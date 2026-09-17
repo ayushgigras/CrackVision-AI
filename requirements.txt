@@ -1,0 +1,18 @@
+# CrackGauge - Core Dependencies
+# Computer Vision & Image Processing
+opencv-python==4.12.0.88
+numpy>=2.0.0
+scikit-image>=0.26.0
+Pillow>=11.0.0
+scipy>=1.16.0
+
+# Data & Visualization
+matplotlib>=3.10.0
+pandas>=2.3.0
+
+# Reporting
+reportlab>=4.4.0
+
+# Utilities
+python-dotenv>=1.0.0
+tqdm>=4.60.0
