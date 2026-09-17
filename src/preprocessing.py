@@ -46,7 +46,7 @@ def to_grayscale(img: np.ndarray) -> np.ndarray:
     return gray
 
 
-def reduce_noise(gray: np.ndarray, ksize: int = 5) -> np.ndarray:
+def reduce_noise(gray: np.ndarray, ksize: int = 9) -> np.ndarray:
     """
     Apply Gaussian blur to reduce high-frequency noise.
     
@@ -64,7 +64,7 @@ def reduce_noise(gray: np.ndarray, ksize: int = 5) -> np.ndarray:
 
 
 def enhance_contrast(gray: np.ndarray,
-                     clip_limit: float = 2.0,
+                     clip_limit: float = 3.0,
                      tile_grid_size: tuple = (8, 8)) -> np.ndarray:
     """
     Apply CLAHE (Contrast Limited Adaptive Histogram Equalization).
@@ -86,8 +86,8 @@ def enhance_contrast(gray: np.ndarray,
 
 
 def adaptive_threshold(enhanced: np.ndarray,
-                       block_size: int = 11,
-                       C: int = 2) -> np.ndarray:
+                       block_size: int = 21,
+                       C: int = 5) -> np.ndarray:
     """
     Apply Adaptive Thresholding to binarize the image.
     
@@ -132,15 +132,15 @@ def morphological_cleanup(binary: np.ndarray) -> np.ndarray:
         (surface texture, dust, stains). We remove them here.
     """
     # Step 1: Opening — remove isolated noise pixels
-    kernel_open = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
-    opened = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel_open, iterations=1)
+    kernel_open = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))  # small: removes noise dots
+    opened = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel_open, iterations=2)
     
     # Step 2: Closing — fill small gaps within crack
-    kernel_close = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
+    kernel_close = cv2.getStructuringElement(cv2.MORPH_RECT, (7, 7))  # larger: fills gaps in crack
     closed = cv2.morphologyEx(opened, cv2.MORPH_CLOSE, kernel_close, iterations=1)
     
     # Step 3: Remove small connected components (area < min_area are noise)
-    mask = _remove_small_components(closed, min_area=100)
+    mask = _remove_small_components(closed, min_area=300)  # 300px² is roughly a 17x17 region
     
     print(f"[✓] Morphological cleanup done")
     return mask
@@ -196,9 +196,9 @@ def run_preprocessing_pipeline(image_path: str,
     # --- Pipeline Steps ---
     original  = load_image(image_path)
     gray      = to_grayscale(original)
-    blurred   = reduce_noise(gray, ksize=5)
-    enhanced  = enhance_contrast(blurred, clip_limit=2.0)
-    binary    = adaptive_threshold(enhanced, block_size=11, C=2)
+    blurred   = reduce_noise(gray, ksize=9)
+    enhanced  = enhance_contrast(blurred, clip_limit=3.0)
+    binary    = adaptive_threshold(enhanced, block_size=21, C=5)
     crack_mask = morphological_cleanup(binary)
     
     results = {
