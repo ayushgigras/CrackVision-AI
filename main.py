@@ -18,16 +18,23 @@ import numpy as np
 if hasattr(sys.stdout, 'reconfigure'):
     sys.stdout.reconfigure(encoding='utf-8', errors='replace')
 
-# Add src/ to path so we can import our modules
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'src'))
+# Ensure project root is on sys.path
+project_root = os.path.dirname(os.path.abspath(__file__))
+if project_root not in sys.path:
+    sys.path.insert(0, project_root)
 
-from preprocessing import run_preprocessing_pipeline, visualize_results
-from segmentation import run_segmentation_pipeline, visualize_segmentation
-from measurement import run_measurement_pipeline, visualize_measurement, visualize_length_measurement
+from src.preprocessing import run_preprocessing_pipeline, visualize_results
+from src.segmentation import run_segmentation_pipeline, visualize_segmentation
+from src.measurement import (
+    run_measurement_pipeline,
+    visualize_measurement,
+    visualize_length_measurement,
+    visualize_orientation_measurement,
+)
 
 
 def process_single_image(image_path: str, output_dir: str, args):
-    """Process a single crack image through Step 1 (Preprocessing), Step 2 (Segmentation), and Step 3/4A (Width & Length Measurement)."""
+    """Process a single crack image through Step 1 (Preprocessing), Step 2 (Segmentation), and Step 3/4A/4B (Width, Length & Orientation)."""
     base_name = os.path.splitext(os.path.basename(image_path))[0]
     
     # --- Step 1: Preprocessing ---
@@ -59,7 +66,7 @@ def process_single_image(image_path: str, output_dir: str, args):
     viz_seg_path = os.path.join(output_dir, f"{base_name}_segmentation_viz.png")
     visualize_segmentation(seg_results, save_path=viz_seg_path)
     
-    # --- Step 3 & 4A: Width & Length Measurement (Medial Axis & Distance Transform) ---
+    # --- Step 3, 4A, 4B: Width, Length & Orientation Measurement ---
     meas_results = run_measurement_pipeline(
         segmentation_results=seg_results,
         output_dir=output_dir,
@@ -74,16 +81,21 @@ def process_single_image(image_path: str, output_dir: str, args):
     viz_len_path = os.path.join(output_dir, f"{base_name}_length_viz.png")
     visualize_length_measurement(meas_results, save_path=viz_len_path)
     
+    # Save Step 4B Orientation Visualization (PCA)
+    viz_orient_path = os.path.join(output_dir, f"{base_name}_orientation_viz.png")
+    visualize_orientation_measurement(meas_results, save_path=viz_orient_path)
+    
     return {
-        'image_name': base_name,
-        'image_path': image_path,
-        'prep':       prep_results,
-        'seg':        seg_results,
-        'meas':       meas_results,
-        'prep_viz':   viz_prep_path,
-        'seg_viz':    viz_seg_path,
-        'meas_viz':   viz_meas_path,
-        'len_viz':    viz_len_path,
+        'image_name':  base_name,
+        'image_path':  image_path,
+        'prep':        prep_results,
+        'seg':         seg_results,
+        'meas':        meas_results,
+        'prep_viz':    viz_prep_path,
+        'seg_viz':     viz_seg_path,
+        'meas_viz':    viz_meas_path,
+        'len_viz':     viz_len_path,
+        'orient_viz':  viz_orient_path,
     }
 
 
@@ -184,40 +196,53 @@ Examples:
         all_reports.append(res)
         
     # --- Print Final Summary Report ---
-    print("\n" + "="*105)
-    print("  CrackGauge Pipeline Execution Summary (Steps 1, 2, 3, 4A)")
-    print("="*105)
-    print(f"{'Image Name':<22} | {'Crack %':<8} | {'Comps':<6} | {'Total Length':<13} | {'Max Width':<11} | {'Mean Width':<11}")
-    print("-" * 105)
+    print("\n" + "="*120)
+    print("  CrackGauge Pipeline Execution Summary (Steps 1, 2, 3, 4A, 4B)")
+    print("="*120)
+    print(f"{'Image Name':<20} | {'Crack %':<8} | {'Comps':<6} | {'Total Length':<13} | {'Max Width':<10} | {'Dominant Angle':<15} | {'Classification':<18}")
+    print("-" * 120)
     for rep in all_reports:
         name = rep['image_name']
         cp_pct = rep['seg']['crack_percent']
         tot_len = rep['meas']['total_length_px']
         n_comps = rep['meas']['component_count']
         max_w = rep['meas']['max_width_px']
-        mean_w = rep['meas']['mean_width_px']
-        print(f"{name:<22} | {cp_pct:>7.2f}% | {n_comps:>6d} | {tot_len:>10.1f} px | {max_w:>9.2f} px | {mean_w:>9.2f} px")
-    print("="*105)
-    print("  * Note: All measurements are reported in PIXELS (ground-truth calibration pending).")
+        dom_ang = rep['meas']['dominant_angle_deg']
+        dom_type = rep['meas']['dominant_type']
+        print(f"{name:<20} | {cp_pct:>7.2f}% | {n_comps:>6d} | {tot_len:>10.1f} px | {max_w:>8.2f} px | {dom_ang:>12.1f} deg | {dom_type:<18}")
+    print("="*120)
+    print("  * Note: Width/Length in PIXELS, Orientation in DEGREES relative to horizontal [0, 180). Calibration pending Step 5.")
     
-    # Detailed Component Breakdown
-    print("\n" + "-"*75)
-    print("  Per-Component Crack Length Breakdown (PIXELS):")
-    print("-" * 75)
+    # Detailed Component Breakdown (Length + PCA Orientation)
+    print("\n" + "-"*85)
+    print("  Per-Component Crack Measurement Breakdown (PIXELS & DEGREES):")
+    print("-" * 85)
     for rep in all_reports:
         name = rep['image_name']
         comps = rep['meas']['components']
+        orients = {c['id']: c for c in rep['meas'].get('component_orientations', [])}
         print(f"\n  [{name}] - {len(comps)} component(s):")
         for c in comps:
-            print(f"    - Comp #{c['id']:2d}: Length = {c['length_px']:>7.1f} px | Skeleton Pts = {c['skeleton_pixels']:>4d} | Mask Area = {c['mask_area']:>4d} px")
-    print("-" * 75)
+            cid = c['id']
+            clen = c['length_px']
+            pts = c['skeleton_pixels']
+            area = c['mask_area']
+            if cid in orients:
+                o_ang = f"{orients[cid]['angle_deg']:.1f} deg"
+                o_type = f"({orients[cid]['orientation_type']})"
+            else:
+                o_ang = "N/A"
+                o_type = "(Too small for PCA)"
+            print(f"    - Comp #{cid:2d}: Length = {clen:>7.1f} px | PCA Angle = {o_ang:>9} {o_type:<20} | Skel = {pts:>4d} px | Area = {area:>4d} px")
+    print("-" * 85)
     
     if args.show:
         import matplotlib.pyplot as plt
         plt.show()
         
     print(f"\n[SUCCESS] Pipeline complete! Output directory: {args.output}/")
-    print("Steps verified: Step 1 (Preprocessing) -> Step 2 (Segmentation) -> Step 3 (Width) -> Step 4A (Length).")
+    print("Steps verified: Step 1 (Preprocessing) -> Step 2 (Segmentation) -> Step 3 (Width) -> Step 4A (Length) -> Step 4B (Orientation).")
+
 
 
 if __name__ == "__main__":

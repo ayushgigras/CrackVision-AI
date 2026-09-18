@@ -419,22 +419,249 @@ def create_length_visualization_image(original_bgr: np.ndarray,
     return vis
 
 
-def run_measurement_pipeline(segmentation_results: dict,
-                             output_dir: str = None,
-                             save_steps: bool = True) -> dict:
+# ==============================================================================
+# STEP 4B: CRACK ORIENTATION MEASUREMENT ONLY (PCA)
+# ==============================================================================
+
+def classify_orientation_angle(angle_deg: float) -> str:
     """
-    Execute Step 3 (Width Measurement) and Step 4A (Length Measurement) Pipeline on segmentation results.
+    Classify orientation angle according to structural civil engineering conventions.
+    
+    Angle is in [0, 180) degrees relative to horizontal (X-axis):
+      - 0° ± 15° (or 180° ± 15°): Horizontal (e.g. beam flexural/tension cracks)
+      - 90° ± 15°: Vertical (e.g. column compression / shrinkage cracks)
+      - Otherwise: Diagonal / Oblique (e.g. shear cracks)
+    """
+    norm_angle = angle_deg % 180.0
+    if norm_angle <= 15.0 or norm_angle >= 165.0:
+        return "Horizontal"
+    elif 75.0 <= norm_angle <= 105.0:
+        return "Vertical"
+    else:
+        return "Diagonal / Oblique"
+
+
+def compute_pca_orientation(points_xy: np.ndarray) -> dict:
+    """
+    Apply Principal Component Analysis (PCA) on 2D coordinates of crack pixels.
     
     Args:
-        segmentation_results: Output dict from segmentation.py
-        output_dir:           Directory to save output files
-        save_steps:           Whether to save images to disk
+        points_xy: Nx2 numpy array of (x, y) coordinates
         
     Returns:
-        dict containing both width and length metrics, skeleton, distance transform, and visual outputs.
+        dict containing:
+            'center': (cx, cy) mean coordinate
+            'angle_deg': float, angle in [0, 180) degrees
+            'orientation_type': str ('Horizontal', 'Vertical', 'Diagonal / Oblique')
+            'eigenvector': 1D array of 2 floats (dx, dy)
+            'eigenvalues': (lambda1, lambda2)
+            'endpoints': (p1, p2) coordinates for plotting the principal axis line
+    """
+    if points_xy is None or len(points_xy) < 3:
+        return {
+            'center': (0.0, 0.0),
+            'angle_deg': 0.0,
+            'orientation_type': 'Undetermined',
+            'eigenvector': np.array([1.0, 0.0], dtype=np.float32),
+            'eigenvalues': (0.0, 0.0),
+            'endpoints': ((0, 0), (0, 0)),
+        }
+        
+    mean, eigenvectors, eigenvalues = cv2.PCACompute2(points_xy.astype(np.float32), mean=None)
+    
+    cx, cy = float(mean[0, 0]), float(mean[0, 1])
+    center = (cx, cy)
+    v1 = eigenvectors[0]  # principal eigenvector (dx, dy)
+    
+    # Angle in radians and degrees relative to horizontal X-axis
+    angle_rad = np.arctan2(v1[1], v1[0])
+    angle_deg = float(np.degrees(angle_rad) % 180.0)
+    
+    lam1 = float(eigenvalues[0, 0])
+    lam2 = float(eigenvalues[1, 0]) if eigenvalues.shape[0] > 1 else 0.0
+    
+    orient_type = classify_orientation_angle(angle_deg)
+    
+    # Axis length proportional to 2 * sqrt(eigenvalue)
+    axis_len = max(25.0, 2.0 * np.sqrt(max(0.0, lam1)))
+    p1 = (int(round(cx - v1[0] * axis_len)), int(round(cy - v1[1] * axis_len)))
+    p2 = (int(round(cx + v1[0] * axis_len)), int(round(cy + v1[1] * axis_len)))
+    
+    return {
+        'center': center,
+        'angle_deg': angle_deg,
+        'orientation_type': orient_type,
+        'eigenvector': v1,
+        'eigenvalues': (lam1, lam2),
+        'endpoints': (p1, p2),
+    }
+
+
+def measure_crack_orientations(crack_mask: np.ndarray,
+                               min_points: int = 30) -> dict:
+    """
+    Measure orientation for each meaningful crack component using PCA.
+    
+    Args:
+        crack_mask: Binary crack mask (uint8)
+        min_points: Minimum component pixel count to be considered meaningful (default: 30)
+        
+    Returns:
+        dict containing:
+            'components': list of dicts for each evaluated component
+            'dominant_angle_deg': float, overall PCA angle across all crack pixels
+            'dominant_type': str, overall orientation classification
+            'evaluated_component_count': int
+    """
+    if crack_mask is None or np.sum(crack_mask > 127) == 0:
+        print("[INFO] No crack pixels found for orientation analysis.")
+        return {
+            'components': [],
+            'dominant_angle_deg': 0.0,
+            'dominant_type': 'Undetermined',
+            'evaluated_component_count': 0,
+        }
+        
+    mask_bin = (crack_mask > 127).astype(np.uint8)
+    num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(mask_bin, connectivity=8)
+    
+    components = []
+    comp_idx = 1
+    
+    all_xs = []
+    all_ys = []
+    
+    for label in range(1, num_labels):
+        area = stats[label, cv2.CC_STAT_AREA]
+        if area < min_points:
+            continue
+            
+        ys, xs = np.where(labels == label)
+        pts = np.column_stack((xs, ys))
+        
+        all_xs.extend(xs)
+        all_ys.extend(ys)
+        
+        pca_res = compute_pca_orientation(pts)
+        
+        components.append({
+            'id': comp_idx,
+            'angle_deg': pca_res['angle_deg'],
+            'orientation_type': pca_res['orientation_type'],
+            'center': pca_res['center'],
+            'endpoints': pca_res['endpoints'],
+            'points_count': len(pts),
+        })
+        comp_idx += 1
+        
+    # Dominant orientation across all crack pixels
+    if len(all_xs) >= 3:
+        all_pts = np.column_stack((all_xs, all_ys))
+        overall_pca = compute_pca_orientation(all_pts)
+        dom_angle = overall_pca['angle_deg']
+        dom_type = overall_pca['orientation_type']
+    else:
+        dom_angle = 0.0
+        dom_type = 'Undetermined'
+        
+    print(f"[OK] PCA orientation analysis complete: {len(components)} meaningful components evaluated.")
+    print(f"     Dominant Orientation: {dom_angle:.1f} deg ({dom_type})")
+    
+    return {
+        'components': components,
+        'dominant_angle_deg': dom_angle,
+        'dominant_type': dom_type,
+        'evaluated_component_count': len(components),
+    }
+
+
+def create_orientation_visualization_image(original_bgr: np.ndarray,
+                                           crack_mask: np.ndarray,
+                                           skeleton: np.ndarray,
+                                           orientations_data: dict) -> np.ndarray:
+    """
+    Generate an annotated image drawing PCA principal axes and orientation angle badges
+    on the original image with cracks.
+    """
+    vis = original_bgr.copy()
+    
+    if crack_mask is None or np.sum(crack_mask > 127) == 0:
+        return vis
+        
+    # Subtle overlay of crack mask
+    mask_bin = crack_mask > 127
+    vis[mask_bin] = cv2.addWeighted(
+        original_bgr[mask_bin], 0.35, np.full_like(original_bgr[mask_bin], (0, 0, 255)), 0.65, 0
+    )
+    
+    # Color palette for axes and badges
+    PALETTE = [
+        (0, 255, 255),    # Yellow
+        (0, 255, 0),      # Lime Green
+        (255, 128, 0),    # Orange/Cyan
+        (255, 0, 255),    # Magenta
+        (0, 165, 255),    # Orange
+        (255, 255, 0),    # Cyan
+        (128, 0, 255),    # Violet
+        (0, 215, 255),    # Gold
+    ]
+    
+    components = orientations_data.get('components', [])
+    
+    for c in components:
+        idx = c['id']
+        color = PALETTE[(idx - 1) % len(PALETTE)]
+        p1, p2 = c['endpoints']
+        cx, cy = int(round(c['center'][0])), int(round(c['center'][1]))
+        
+        # Draw PCA Principal Axis line (thick with dark outline for contrast)
+        cv2.line(vis, p1, p2, (20, 20, 20), 4, cv2.LINE_AA)
+        cv2.line(vis, p1, p2, color, 2, cv2.LINE_AA)
+        
+        # Draw centroid marker
+        cv2.circle(vis, (cx, cy), 6, (20, 20, 20), -1)
+        cv2.circle(vis, (cx, cy), 4, color, -1)
+        
+        # Badge annotation: "#ID: XX.X° (Type)"
+        badge = f"#{idx}: {c['angle_deg']:.1f}deg ({c['orientation_type']})"
+        tx = int(np.clip(cx + 10, 10, original_bgr.shape[1] - 220))
+        ty = int(np.clip(cy - 10, 25, original_bgr.shape[0] - 10))
+        
+        (tw, th), _ = cv2.getTextSize(badge, cv2.FONT_HERSHEY_SIMPLEX, 0.45, 1)
+        cv2.rectangle(vis, (tx - 3, ty - th - 3), (tx + tw + 3, ty + 3), (20, 20, 20), -1)
+        cv2.rectangle(vis, (tx - 3, ty - th - 3), (tx + tw + 3, ty + 3), color, 1)
+        cv2.putText(vis, badge, (tx, ty), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1, cv2.LINE_AA)
+        
+    # Top HUD banner
+    dom_angle = orientations_data.get('dominant_angle_deg', 0.0)
+    dom_type = orientations_data.get('dominant_type', 'Undetermined')
+    hud_text = f"Dominant Orientation: {dom_angle:.1f}deg ({dom_type})  |  PCA Comps: {len(components)}"
+    (hw, hh), _ = cv2.getTextSize(hud_text, cv2.FONT_HERSHEY_SIMPLEX, 0.60, 2)
+    cv2.rectangle(vis, (10, 10), (10 + hw + 20, 10 + hh + 16), (20, 20, 20), -1)
+    cv2.rectangle(vis, (10, 10), (10 + hw + 20, 10 + hh + 16), (255, 128, 0), 2)
+    cv2.putText(vis, hud_text, (20, 10 + hh + 8), cv2.FONT_HERSHEY_SIMPLEX, 0.60, (0, 255, 255), 2, cv2.LINE_AA)
+    
+    return vis
+
+
+def run_measurement_pipeline(segmentation_results: dict,
+                             output_dir: str = None,
+                             min_orientation_points: int = 30,
+                             save_steps: bool = True) -> dict:
+    """
+    Execute Step 3 (Width), Step 4A (Length), and Step 4B (Orientation) Pipeline on segmentation results.
+    
+    Args:
+        segmentation_results:    Output dict from segmentation.py
+        output_dir:              Directory to save output files
+        min_orientation_points:  Minimum component points for PCA orientation analysis
+        save_steps:              Whether to save images to disk
+        
+    Returns:
+        dict containing width, length, and orientation metrics, skeleton, and visual outputs.
     """
     print("\n" + "="*60)
-    print("  CrackGauge Step 3 & 4A: Width & Length Measurement (Pixels)")
+    print("  CrackGauge Steps 3, 4A, 4B: Width, Length & Orientation")
     print("="*60)
     
     original = segmentation_results['original']
@@ -452,33 +679,45 @@ def run_measurement_pipeline(segmentation_results: dict,
     # 4. Measure Lengths (Step 4A)
     length_stats = measure_crack_lengths(final_mask, skeleton)
     
-    # 5. Width Heatmap Image
+    # 5. Measure Orientation via PCA (Step 4B)
+    orientation_stats = measure_crack_orientations(final_mask, min_points=min_orientation_points)
+    
+    # 6. Width Heatmap Image
     width_vis = create_width_visualization_image(
         original, skeleton, width_stats['width_map'], width_stats['max_width_coords']
     )
     
-    # 6. Length Component Image
+    # 7. Length Component Image
     length_vis = create_length_visualization_image(
         original, final_mask, skeleton, length_stats['components'], length_stats['total_length_px']
     )
     
+    # 8. Orientation PCA Image
+    orientation_vis = create_orientation_visualization_image(
+        original, final_mask, skeleton, orientation_stats
+    )
+    
     results = {
-        'original':          original,
-        'final_mask':        final_mask,
-        'skeleton':          skeleton,
-        'dist_transform':    dist_transform,
-        'width_map':         width_stats['width_map'],
-        'width_vis':         width_vis,
-        'length_vis':        length_vis,
-        'max_width_px':      width_stats['max_width_px'],
-        'mean_width_px':     width_stats['mean_width_px'],
-        'median_width_px':   width_stats['median_width_px'],
-        'std_width_px':      width_stats['std_width_px'],
-        'skeleton_points':   width_stats['skeleton_points'],
-        'max_width_coords':  width_stats['max_width_coords'],
-        'total_length_px':   length_stats['total_length_px'],
-        'component_count':   length_stats['component_count'],
-        'components':        length_stats['components'],
+        'original':                   original,
+        'final_mask':                 final_mask,
+        'skeleton':                   skeleton,
+        'dist_transform':             dist_transform,
+        'width_map':                  width_stats['width_map'],
+        'width_vis':                  width_vis,
+        'length_vis':                 length_vis,
+        'orientation_vis':            orientation_vis,
+        'max_width_px':               width_stats['max_width_px'],
+        'mean_width_px':              width_stats['mean_width_px'],
+        'median_width_px':            width_stats['median_width_px'],
+        'std_width_px':               width_stats['std_width_px'],
+        'skeleton_points':            width_stats['skeleton_points'],
+        'max_width_coords':           width_stats['max_width_coords'],
+        'total_length_px':            length_stats['total_length_px'],
+        'component_count':            length_stats['component_count'],
+        'components':                 length_stats['components'],
+        'dominant_angle_deg':         orientation_stats['dominant_angle_deg'],
+        'dominant_type':              orientation_stats['dominant_type'],
+        'component_orientations':     orientation_stats['components'],
     }
     
     # Save outputs if requested
@@ -500,18 +739,22 @@ def run_measurement_pipeline(segmentation_results: dict,
         
         # Step 4A file
         cv2.imwrite(os.path.join(output_dir, f"{base_name}_13_length_measurement.jpg"), length_vis)
+        
+        # Step 4B file
+        cv2.imwrite(os.path.join(output_dir, f"{base_name}_14_orientation_measurement.jpg"), orientation_vis)
         print(f"[OK] Measurement step images saved to: {output_dir}")
         
     print(f"\n{'='*60}")
-    print(f"  Measurement Summary (PIXELS):")
-    print(f"  Total Crack Length: {length_stats['total_length_px']:.2f} px")
-    print(f"  Crack Components  : {length_stats['component_count']}")
-    print(f"  Max Width         : {width_stats['max_width_px']:.2f} px")
-    print(f"  Mean Width        : {width_stats['mean_width_px']:.2f} px")
-    print(f"  Median Width      : {width_stats['median_width_px']:.2f} px")
+    print(f"  Measurement Summary (PIXELS & DEGREES):")
+    print(f"  Total Crack Length  : {length_stats['total_length_px']:.2f} px")
+    print(f"  Crack Components    : {length_stats['component_count']}")
+    print(f"  Max Width           : {width_stats['max_width_px']:.2f} px")
+    print(f"  Mean Width          : {width_stats['mean_width_px']:.2f} px")
+    print(f"  Dominant Orientation: {orientation_stats['dominant_angle_deg']:.1f} deg ({orientation_stats['dominant_type']})")
     print(f"{'='*60}\n")
     
     return results
+
 
 
 def visualize_measurement(results: dict, save_path: str = None):
@@ -620,4 +863,60 @@ def visualize_length_measurement(results: dict, save_path: str = None):
         plt.close()
     else:
         plt.show()
+
+
+def visualize_orientation_measurement(results: dict, save_path: str = None):
+    """
+    Create a 4-panel visual comparison for Orientation Measurement (PCA):
+      Panel 1: Original Concrete Image
+      Panel 2: Final Segmented Crack Mask
+      Panel 3: Crack Skeleton with Centroids
+      Panel 4: PCA Orientation Map (Principal Axes & Direction Vectors)
+    """
+    import matplotlib.pyplot as plt
+    import matplotlib.gridspec as gridspec
+    
+    fig = plt.figure(figsize=(16, 12))
+    fig.suptitle("CrackGauge - Step 4B: Crack Orientation Measurement (PCA Principal Direction)",
+                 fontsize=15, fontweight='bold', y=0.98)
+                 
+    gs = gridspec.GridSpec(2, 2, figure=fig, hspace=0.25, wspace=0.20)
+    
+    # Panel 1: Original
+    ax1 = fig.add_subplot(gs[0, 0])
+    ax1.imshow(cv2.cvtColor(results['original'], cv2.COLOR_BGR2RGB))
+    ax1.set_title("1. Original Image", fontsize=11, fontweight='bold', pad=8)
+    ax1.axis('off')
+    
+    # Panel 2: Crack Mask
+    ax2 = fig.add_subplot(gs[0, 1])
+    ax2.imshow(results['final_mask'], cmap='gray')
+    ax2.set_title("2. Final Crack Mask (Step 2)", fontsize=11, fontweight='bold', pad=8)
+    ax2.axis('off')
+    
+    # Panel 3: Skeleton
+    ax3 = fig.add_subplot(gs[1, 0])
+    ax3.imshow(results['skeleton'], cmap='hot')
+    dom_ang = results.get('dominant_angle_deg', 0.0)
+    dom_type = results.get('dominant_type', 'Undetermined')
+    n_pts = results.get('skeleton_points', 0)
+    ax3.set_title(f"3. Crack Skeleton ({n_pts:,} px)",
+                  fontsize=11, fontweight='bold', pad=8)
+    ax3.axis('off')
+    
+    # Panel 4: Orientation Map Vis
+    ax4 = fig.add_subplot(gs[1, 1])
+    ax4.imshow(cv2.cvtColor(results['orientation_vis'], cv2.COLOR_BGR2RGB))
+    ax4.set_title(f"4. PCA Orientation Map [Dominant: {dom_ang:.1f}deg ({dom_type})]",
+                  fontsize=11, fontweight='bold', color='#8e44ad', pad=8)
+    ax4.axis('off')
+    
+    if save_path:
+        plt.savefig(save_path, dpi=150, bbox_inches='tight',
+                    facecolor='white', edgecolor='none')
+        print(f"[OK] Orientation measurement visualization saved: {save_path}")
+        plt.close()
+    else:
+        plt.show()
+
 
