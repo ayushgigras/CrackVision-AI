@@ -44,12 +44,12 @@ def compute_skeleton(crack_mask: np.ndarray) -> np.ndarray:
     Returns:
         Binary skeleton mask (uint8, values 0 or 255)
     """
-    if crack_mask is None or np.sum(crack_mask > 0) == 0:
+    if crack_mask is None or np.sum(crack_mask > 127) == 0:
         print("[WARNING] Empty crack mask received for skeletonization.")
         return np.zeros_like(crack_mask if crack_mask is not None else np.zeros((1, 1), dtype=np.uint8))
         
     # skeletonize requires boolean input
-    mask_bool = crack_mask > 0
+    mask_bool = crack_mask > 127
     skeleton_bool = skeletonize(mask_bool)
     skeleton_uint8 = (skeleton_bool * 255).astype(np.uint8)
     
@@ -71,12 +71,12 @@ def compute_distance_transform(crack_mask: np.ndarray) -> np.ndarray:
     Returns:
         Floating-point distance transform image (float32)
     """
-    if crack_mask is None or np.sum(crack_mask > 0) == 0:
+    if crack_mask is None or np.sum(crack_mask > 127) == 0:
         return np.zeros((1, 1), dtype=np.float32) if crack_mask is None else np.zeros_like(crack_mask, dtype=np.float32)
         
     # Ensure binary uint8 with 0 and 255
     binary = np.zeros_like(crack_mask, dtype=np.uint8)
-    binary[crack_mask > 0] = 255
+    binary[crack_mask > 127] = 255
     
     dist_transform = cv2.distanceTransform(binary, distanceType=cv2.DIST_L2, maskSize=5)
     max_dist = float(dist_transform.max())
@@ -227,11 +227,203 @@ def create_width_visualization_image(original_bgr: np.ndarray,
     return vis
 
 
+# ==============================================================================
+# STEP 4A: CRACK LENGTH MEASUREMENT ONLY
+# ==============================================================================
+
+def measure_crack_lengths(crack_mask: np.ndarray,
+                          skeleton: np.ndarray = None) -> dict:
+    """
+    Calculate total crack length and per-component crack lengths in pixels from the skeleton.
+    
+    Path Length Calculation:
+        For each connected component, adjacent 8-connected skeleton pixels are traversed:
+          - Orthogonal neighbor step: distance = 1.0 px
+          - Diagonal neighbor step:   distance = sqrt(2) approx 1.414 px
+        Undirected neighbor edges are summed to obtain the true path length in pixels.
+        
+    Args:
+        crack_mask: Binary crack mask (uint8)
+        skeleton:   Optional precomputed 1-pixel wide skeleton (uint8)
+        
+    Returns:
+        dict containing:
+            'total_length_px':  float, sum of all component lengths in pixels
+            'component_count':  int, number of crack components
+            'components':       list of dicts for each component:
+                {
+                    'id':              int (1-based),
+                    'length_px':       float,
+                    'skeleton_pixels': int,
+                    'mask_area':       int,
+                    'centroid':        tuple (cx, cy),
+                    'bbox':            tuple (x, y, w, h)
+                }
+    """
+    if crack_mask is None or np.sum(crack_mask > 127) == 0:
+        print("[INFO] No crack pixels found for length measurement. Total length set to 0.0 px.")
+        return {
+            'total_length_px': 0.0,
+            'component_count': 0,
+            'components': [],
+        }
+        
+    if skeleton is None:
+        skeleton = compute_skeleton(crack_mask)
+        
+    mask_bin = (crack_mask > 127).astype(np.uint8)
+    skel_bool = skeleton > 0
+    
+    # Label connected components on mask
+    num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(mask_bin, connectivity=8)
+    
+    # 4 forward directions for undirected edge counting: (dy, dx, distance)
+    fwd_dirs = [
+        (0, 1, 1.0),
+        (1, 0, 1.0),
+        (1, 1, 1.41421356),
+        (1, -1, 1.41421356),
+    ]
+    
+    components = []
+    total_length = 0.0
+    comp_idx = 1
+    
+    for label in range(1, num_labels):
+        comp_skel_mask = (labels == label) & skel_bool
+        ys, xs = np.where(comp_skel_mask)
+        skel_pts_count = len(ys)
+        
+        if skel_pts_count == 0:
+            continue
+            
+        pts_set = set(zip(ys, xs))
+        comp_len = 0.0
+        edges_found = 0
+        
+        if skel_pts_count == 1:
+            comp_len = 1.0
+        else:
+            for y, x in zip(ys, xs):
+                for dy, dx, weight in fwd_dirs:
+                    if (y + dy, x + dx) in pts_set:
+                        comp_len += weight
+                        edges_found += 1
+            if edges_found == 0:
+                comp_len = float(skel_pts_count)
+                
+        total_length += comp_len
+        
+        bx = int(stats[label, cv2.CC_STAT_LEFT])
+        by = int(stats[label, cv2.CC_STAT_TOP])
+        bw = int(stats[label, cv2.CC_STAT_WIDTH])
+        bh = int(stats[label, cv2.CC_STAT_HEIGHT])
+        area = int(stats[label, cv2.CC_STAT_AREA])
+        cx, cy = float(centroids[label][0]), float(centroids[label][1])
+        
+        components.append({
+            'id': comp_idx,
+            'length_px': comp_len,
+            'skeleton_pixels': skel_pts_count,
+            'mask_area': area,
+            'centroid': (cx, cy),
+            'bbox': (bx, by, bw, bh),
+        })
+        comp_idx += 1
+        
+    print(f"[OK] Length calculation completed: {len(components)} components | Total Length: {total_length:.2f} px")
+    return {
+        'total_length_px': total_length,
+        'component_count': len(components),
+        'components': components,
+    }
+
+
+def create_length_visualization_image(original_bgr: np.ndarray,
+                                      crack_mask: np.ndarray,
+                                      skeleton: np.ndarray,
+                                      components: list,
+                                      total_length_px: float) -> np.ndarray:
+    """
+    Generate an annotated image highlighting each crack component's path in distinct colors
+    with component ID and length callout badges.
+    """
+    vis = original_bgr.copy()
+    
+    if not components or skeleton is None or np.sum(skeleton > 0) == 0:
+        return vis
+        
+    # High-contrast color palette (BGR) for distinguishing components
+    PALETTE = [
+        (0, 255, 255),    # Yellow
+        (0, 255, 0),      # Lime Green
+        (255, 128, 0),    # Orange/Cyan
+        (255, 0, 255),    # Magenta
+        (0, 165, 255),    # Orange
+        (255, 255, 0),    # Cyan
+        (128, 0, 255),    # Violet
+        (0, 215, 255),    # Gold
+        (50, 205, 50),    # Lime
+        (255, 192, 203),  # Pink
+        (220, 20, 60),    # Crimson
+        (0, 128, 255),    # Amber
+        (240, 230, 140),  # Khaki
+    ]
+    
+    mask_bin = (crack_mask > 127).astype(np.uint8)
+    num_labels, labels, _, _ = cv2.connectedComponentsWithStats(mask_bin, connectivity=8)
+    skel_bool = skeleton > 0
+    
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+    
+    comp_map = {c['id']: c for c in components}
+    actual_idx = 1
+    
+    for label in range(1, num_labels):
+        comp_skel_mask = (labels == label) & skel_bool
+        if not np.any(comp_skel_mask):
+            continue
+            
+        color = PALETTE[(actual_idx - 1) % len(PALETTE)]
+        
+        # Dilate component skeleton for crisp visibility
+        dilated = cv2.dilate(comp_skel_mask.astype(np.uint8), kernel, iterations=1) > 0
+        vis[dilated] = color
+        
+        # Add badge text near centroid if component is significant
+        if actual_idx in comp_map:
+            cdata = comp_map[actual_idx]
+            cx, cy = cdata['centroid']
+            clen = cdata['length_px']
+            
+            # Badge text
+            badge = f"#{actual_idx}: {clen:.1f}px"
+            tx = int(np.clip(cx + 8, 10, original_bgr.shape[1] - 120))
+            ty = int(np.clip(cy - 8, 20, original_bgr.shape[0] - 10))
+            
+            # Small dark background for text readability
+            (tw, th), _ = cv2.getTextSize(badge, cv2.FONT_HERSHEY_SIMPLEX, 0.45, 1)
+            cv2.rectangle(vis, (tx - 3, ty - th - 3), (tx + tw + 3, ty + 3), (20, 20, 20), -1)
+            cv2.rectangle(vis, (tx - 3, ty - th - 3), (tx + tw + 3, ty + 3), color, 1)
+            cv2.putText(vis, badge, (tx, ty), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1, cv2.LINE_AA)
+            
+        actual_idx += 1
+        
+    # Top HUD banner with overall length summary
+    hud_text = f"Total Crack Length: {total_length_px:.1f} px  |  Components: {len(components)}"
+    (hw, hh), _ = cv2.getTextSize(hud_text, cv2.FONT_HERSHEY_SIMPLEX, 0.65, 2)
+    cv2.rectangle(vis, (10, 10), (10 + hw + 20, 10 + hh + 16), (20, 20, 20), -1)
+    cv2.rectangle(vis, (10, 10), (10 + hw + 20, 10 + hh + 16), (0, 200, 255), 2)
+    cv2.putText(vis, hud_text, (20, 10 + hh + 8), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 255, 255), 2, cv2.LINE_AA)
+    
+    return vis
+
+
 def run_measurement_pipeline(segmentation_results: dict,
                              output_dir: str = None,
                              save_steps: bool = True) -> dict:
     """
-    Execute Step 3 Width Measurement Pipeline on segmentation results.
+    Execute Step 3 (Width Measurement) and Step 4A (Length Measurement) Pipeline on segmentation results.
     
     Args:
         segmentation_results: Output dict from segmentation.py
@@ -239,10 +431,10 @@ def run_measurement_pipeline(segmentation_results: dict,
         save_steps:           Whether to save images to disk
         
     Returns:
-        dict containing measurement metrics, skeleton, distance transform, and width image.
+        dict containing both width and length metrics, skeleton, distance transform, and visual outputs.
     """
     print("\n" + "="*60)
-    print("  CrackGauge Step 3: Crack Width Measurement (Pixels)")
+    print("  CrackGauge Step 3 & 4A: Width & Length Measurement (Pixels)")
     print("="*60)
     
     original = segmentation_results['original']
@@ -254,12 +446,20 @@ def run_measurement_pipeline(segmentation_results: dict,
     # 2. Distance Transform
     dist_transform = compute_distance_transform(final_mask)
     
-    # 3. Measure Widths
-    measure_stats = measure_crack_widths(final_mask, skeleton, dist_transform)
+    # 3. Measure Widths (Step 3)
+    width_stats = measure_crack_widths(final_mask, skeleton, dist_transform)
     
-    # 4. Width Heatmap / Visualization Image
+    # 4. Measure Lengths (Step 4A)
+    length_stats = measure_crack_lengths(final_mask, skeleton)
+    
+    # 5. Width Heatmap Image
     width_vis = create_width_visualization_image(
-        original, skeleton, measure_stats['width_map'], measure_stats['max_width_coords']
+        original, skeleton, width_stats['width_map'], width_stats['max_width_coords']
+    )
+    
+    # 6. Length Component Image
+    length_vis = create_length_visualization_image(
+        original, final_mask, skeleton, length_stats['components'], length_stats['total_length_px']
     )
     
     results = {
@@ -267,14 +467,18 @@ def run_measurement_pipeline(segmentation_results: dict,
         'final_mask':        final_mask,
         'skeleton':          skeleton,
         'dist_transform':    dist_transform,
-        'width_map':         measure_stats['width_map'],
+        'width_map':         width_stats['width_map'],
         'width_vis':         width_vis,
-        'max_width_px':      measure_stats['max_width_px'],
-        'mean_width_px':     measure_stats['mean_width_px'],
-        'median_width_px':   measure_stats['median_width_px'],
-        'std_width_px':      measure_stats['std_width_px'],
-        'skeleton_points':   measure_stats['skeleton_points'],
-        'max_width_coords':  measure_stats['max_width_coords'],
+        'length_vis':        length_vis,
+        'max_width_px':      width_stats['max_width_px'],
+        'mean_width_px':     width_stats['mean_width_px'],
+        'median_width_px':   width_stats['median_width_px'],
+        'std_width_px':      width_stats['std_width_px'],
+        'skeleton_points':   width_stats['skeleton_points'],
+        'max_width_coords':  width_stats['max_width_coords'],
+        'total_length_px':   length_stats['total_length_px'],
+        'component_count':   length_stats['component_count'],
+        'components':        length_stats['components'],
     }
     
     # Save outputs if requested
@@ -282,10 +486,9 @@ def run_measurement_pipeline(segmentation_results: dict,
         os.makedirs(output_dir, exist_ok=True)
         base_name = segmentation_results.get('image_name', 'crack_result')
         
-        # Save skeleton
+        # Step 3 files
         cv2.imwrite(os.path.join(output_dir, f"{base_name}_10_skeleton.jpg"), skeleton)
         
-        # Normalize distance transform for visual file
         dist_max = float(dist_transform.max())
         if dist_max > 0:
             dist_vis = (dist_transform / dist_max * 255.0).astype(np.uint8)
@@ -293,17 +496,19 @@ def run_measurement_pipeline(segmentation_results: dict,
         else:
             dist_color = np.zeros_like(original)
         cv2.imwrite(os.path.join(output_dir, f"{base_name}_11_distance_transform.jpg"), dist_color)
-        
-        # Save width visualization
         cv2.imwrite(os.path.join(output_dir, f"{base_name}_12_width_measurement.jpg"), width_vis)
+        
+        # Step 4A file
+        cv2.imwrite(os.path.join(output_dir, f"{base_name}_13_length_measurement.jpg"), length_vis)
         print(f"[OK] Measurement step images saved to: {output_dir}")
         
     print(f"\n{'='*60}")
-    print(f"  Width Measurement Summary (PIXELS):")
-    print(f"  Max Width    : {measure_stats['max_width_px']:.2f} px")
-    print(f"  Mean Width   : {measure_stats['mean_width_px']:.2f} px")
-    print(f"  Median Width : {measure_stats['median_width_px']:.2f} px")
-    print(f"  Sample Points: {measure_stats['skeleton_points']:,} px")
+    print(f"  Measurement Summary (PIXELS):")
+    print(f"  Total Crack Length: {length_stats['total_length_px']:.2f} px")
+    print(f"  Crack Components  : {length_stats['component_count']}")
+    print(f"  Max Width         : {width_stats['max_width_px']:.2f} px")
+    print(f"  Mean Width        : {width_stats['mean_width_px']:.2f} px")
+    print(f"  Median Width      : {width_stats['median_width_px']:.2f} px")
     print(f"{'='*60}\n")
     
     return results
@@ -311,7 +516,7 @@ def run_measurement_pipeline(segmentation_results: dict,
 
 def visualize_measurement(results: dict, save_path: str = None):
     """
-    Create a 4-panel visual comparison:
+    Create a 4-panel visual comparison for Width Measurement:
       Panel 1: Original Concrete Image
       Panel 2: Final Segmented Crack Mask
       Panel 3: Crack Skeleton (Medial Axis)
@@ -357,7 +562,62 @@ def visualize_measurement(results: dict, save_path: str = None):
     if save_path:
         plt.savefig(save_path, dpi=150, bbox_inches='tight',
                     facecolor='white', edgecolor='none')
-        print(f"[OK] Measurement visualization saved: {save_path}")
+        print(f"[OK] Width measurement visualization saved: {save_path}")
         plt.close()
     else:
         plt.show()
+
+
+def visualize_length_measurement(results: dict, save_path: str = None):
+    """
+    Create a 4-panel visual comparison for Length Measurement:
+      Panel 1: Original Concrete Image
+      Panel 2: Final Segmented Crack Mask
+      Panel 3: Crack Skeleton with Colored Components
+      Panel 4: Length Measurement Map (with Component Badges & Total Length)
+    """
+    import matplotlib.pyplot as plt
+    import matplotlib.gridspec as gridspec
+    
+    fig = plt.figure(figsize=(16, 12))
+    fig.suptitle("CrackGauge - Step 4A: Crack Length Measurement (Skeleton Path & Components)",
+                 fontsize=15, fontweight='bold', y=0.98)
+                 
+    gs = gridspec.GridSpec(2, 2, figure=fig, hspace=0.25, wspace=0.20)
+    
+    # Panel 1: Original
+    ax1 = fig.add_subplot(gs[0, 0])
+    ax1.imshow(cv2.cvtColor(results['original'], cv2.COLOR_BGR2RGB))
+    ax1.set_title("1. Original Image", fontsize=11, fontweight='bold', pad=8)
+    ax1.axis('off')
+    
+    # Panel 2: Crack Mask
+    ax2 = fig.add_subplot(gs[0, 1])
+    ax2.imshow(results['final_mask'], cmap='gray')
+    ax2.set_title("2. Final Crack Mask (Step 2)", fontsize=11, fontweight='bold', pad=8)
+    ax2.axis('off')
+    
+    # Panel 3: Skeleton
+    ax3 = fig.add_subplot(gs[1, 0])
+    ax3.imshow(results['skeleton'], cmap='hot')
+    tot_len = results.get('total_length_px', 0.0)
+    n_comp = results.get('component_count', 0)
+    ax3.set_title(f"3. Crack Skeleton ({results['skeleton_points']:,} px | {n_comp} Components)",
+                  fontsize=11, fontweight='bold', pad=8)
+    ax3.axis('off')
+    
+    # Panel 4: Length Measurement Vis
+    ax4 = fig.add_subplot(gs[1, 1])
+    ax4.imshow(cv2.cvtColor(results['length_vis'], cv2.COLOR_BGR2RGB))
+    ax4.set_title(f"4. Length Measurement Map [Total Length: {tot_len:.1f} px | {n_comp} Comps]",
+                  fontsize=11, fontweight='bold', color='#27ae60', pad=8)
+    ax4.axis('off')
+    
+    if save_path:
+        plt.savefig(save_path, dpi=150, bbox_inches='tight',
+                    facecolor='white', edgecolor='none')
+        print(f"[OK] Length measurement visualization saved: {save_path}")
+        plt.close()
+    else:
+        plt.show()
+

@@ -23,11 +23,11 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'src'))
 
 from preprocessing import run_preprocessing_pipeline, visualize_results
 from segmentation import run_segmentation_pipeline, visualize_segmentation
-from measurement import run_measurement_pipeline, visualize_measurement
+from measurement import run_measurement_pipeline, visualize_measurement, visualize_length_measurement
 
 
 def process_single_image(image_path: str, output_dir: str, args):
-    """Process a single crack image through Step 1 (Preprocessing), Step 2 (Segmentation), and Step 3 (Width Measurement)."""
+    """Process a single crack image through Step 1 (Preprocessing), Step 2 (Segmentation), and Step 3/4A (Width & Length Measurement)."""
     base_name = os.path.splitext(os.path.basename(image_path))[0]
     
     # --- Step 1: Preprocessing ---
@@ -59,16 +59,20 @@ def process_single_image(image_path: str, output_dir: str, args):
     viz_seg_path = os.path.join(output_dir, f"{base_name}_segmentation_viz.png")
     visualize_segmentation(seg_results, save_path=viz_seg_path)
     
-    # --- Step 3: Crack Width Measurement (Medial Axis & Distance Transform) ---
+    # --- Step 3 & 4A: Width & Length Measurement (Medial Axis & Distance Transform) ---
     meas_results = run_measurement_pipeline(
         segmentation_results=seg_results,
         output_dir=output_dir,
         save_steps=True
     )
     
-    # Save Step 3 Visualization
+    # Save Step 3 Width Visualization
     viz_meas_path = os.path.join(output_dir, f"{base_name}_measurement_viz.png")
     visualize_measurement(meas_results, save_path=viz_meas_path)
+    
+    # Save Step 4A Length Visualization
+    viz_len_path = os.path.join(output_dir, f"{base_name}_length_viz.png")
+    visualize_length_measurement(meas_results, save_path=viz_len_path)
     
     return {
         'image_name': base_name,
@@ -79,6 +83,7 @@ def process_single_image(image_path: str, output_dir: str, args):
         'prep_viz':   viz_prep_path,
         'seg_viz':    viz_seg_path,
         'meas_viz':   viz_meas_path,
+        'len_viz':    viz_len_path,
     }
 
 
@@ -179,28 +184,40 @@ Examples:
         all_reports.append(res)
         
     # --- Print Final Summary Report ---
-    print("\n" + "="*95)
-    print("  CrackGauge Pipeline Execution Summary (Steps 1 + 2 + 3)")
-    print("="*95)
-    print(f"{'Image Name':<22} | {'Crack %':<8} | {'Skeleton Pts':<13} | {'Max Width':<11} | {'Mean Width':<11} | {'Median Width':<12}")
-    print("-" * 95)
+    print("\n" + "="*105)
+    print("  CrackGauge Pipeline Execution Summary (Steps 1, 2, 3, 4A)")
+    print("="*105)
+    print(f"{'Image Name':<22} | {'Crack %':<8} | {'Comps':<6} | {'Total Length':<13} | {'Max Width':<11} | {'Mean Width':<11}")
+    print("-" * 105)
     for rep in all_reports:
         name = rep['image_name']
         cp_pct = rep['seg']['crack_percent']
-        sk_pts = rep['meas']['skeleton_points']
+        tot_len = rep['meas']['total_length_px']
+        n_comps = rep['meas']['component_count']
         max_w = rep['meas']['max_width_px']
         mean_w = rep['meas']['mean_width_px']
-        med_w = rep['meas']['median_width_px']
-        print(f"{name:<22} | {cp_pct:>7.2f}% | {sk_pts:>11,d}px | {max_w:>9.2f}px | {mean_w:>10.2f}px | {med_w:>11.2f}px")
-    print("="*95)
-    print("  * Note: All widths are reported in PIXELS (calibrated mm conversion pending Step 4).")
+        print(f"{name:<22} | {cp_pct:>7.2f}% | {n_comps:>6d} | {tot_len:>10.1f} px | {max_w:>9.2f} px | {mean_w:>9.2f} px")
+    print("="*105)
+    print("  * Note: All measurements are reported in PIXELS (ground-truth calibration pending).")
+    
+    # Detailed Component Breakdown
+    print("\n" + "-"*75)
+    print("  Per-Component Crack Length Breakdown (PIXELS):")
+    print("-" * 75)
+    for rep in all_reports:
+        name = rep['image_name']
+        comps = rep['meas']['components']
+        print(f"\n  [{name}] - {len(comps)} component(s):")
+        for c in comps:
+            print(f"    - Comp #{c['id']:2d}: Length = {c['length_px']:>7.1f} px | Skeleton Pts = {c['skeleton_pixels']:>4d} | Mask Area = {c['mask_area']:>4d} px")
+    print("-" * 75)
     
     if args.show:
         import matplotlib.pyplot as plt
         plt.show()
         
     print(f"\n[SUCCESS] Pipeline complete! Output directory: {args.output}/")
-    print("Steps verified: Step 1 (Preprocessing) -> Step 2 (Segmentation) -> Step 3 (Width Measurement).")
+    print("Steps verified: Step 1 (Preprocessing) -> Step 2 (Segmentation) -> Step 3 (Width) -> Step 4A (Length).")
 
 
 if __name__ == "__main__":
