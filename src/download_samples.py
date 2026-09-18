@@ -1,6 +1,4 @@
 """
-import sys
-sys.stdout.reconfigure(encoding='utf-8', errors='replace')
 CrackGauge - Sample Image Downloader
 ======================================
 Downloads real crack images from public datasets for testing.
@@ -12,6 +10,10 @@ Run this once to populate data/sample_images/
 import os
 import urllib.request
 import sys
+
+# Ensure UTF-8 output on Windows terminal
+if hasattr(sys.stdout, 'reconfigure'):
+    sys.stdout.reconfigure(encoding='utf-8', errors='replace')
 
 
 # Public domain concrete crack images from various sources

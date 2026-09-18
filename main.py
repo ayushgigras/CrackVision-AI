@@ -13,6 +13,10 @@ import argparse
 import os
 import sys
 
+# Ensure UTF-8 output on Windows terminal
+if hasattr(sys.stdout, 'reconfigure'):
+    sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+
 # Add src/ to path so we can import our modules
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'src'))
 
@@ -21,7 +25,7 @@ from preprocessing import run_preprocessing_pipeline, visualize_results
 
 def main():
     parser = argparse.ArgumentParser(
-        description="CrackGauge — Computer Vision Crack Measurement Pipeline",
+        description="CrackGauge - Computer Vision Crack Measurement Pipeline",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
@@ -70,7 +74,7 @@ Examples:
                 break
     
     if image_path is None:
-        print("❌ No image found!")
+        print("[ERROR] No image found!")
         print("   Place a crack image in:  data/sample_images/")
         print("   Or run: python main.py --image your_image.jpg")
         sys.exit(1)
@@ -90,12 +94,12 @@ Examples:
         import matplotlib.pyplot as plt
         plt.show()
     
-    print(f"\n✅ Pipeline complete!")
+    print(f"\n[SUCCESS] Pipeline complete!")
     print(f"   Results saved to: {args.output}/")
     print(f"   Files created:")
-    for f in os.listdir(args.output):
+    for f in sorted(os.listdir(args.output)):
         size = os.path.getsize(os.path.join(args.output, f))
-        print(f"     • {f}  ({size/1024:.1f} KB)")
+        print(f"     * {f}  ({size/1024:.1f} KB)")
 
 
 if __name__ == "__main__":

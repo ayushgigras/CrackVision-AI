@@ -18,6 +18,11 @@ Author: CrackGauge Team (Manish, Sachin, Ayush)
 import cv2
 import numpy as np
 import os
+import sys
+
+# Ensure UTF-8 output on Windows terminal
+if hasattr(sys.stdout, 'reconfigure'):
+    sys.stdout.reconfigure(encoding='utf-8', errors='replace')
 
 
 def load_image(image_path: str) -> np.ndarray:
@@ -32,7 +37,7 @@ def load_image(image_path: str) -> np.ndarray:
     if img is None:
         raise ValueError(f"Could not read image (unsupported format?): {image_path}")
     
-    print(f"[✓] Loaded image: {os.path.basename(image_path)} | Shape: {img.shape}")
+    print(f"[OK] Loaded image: {os.path.basename(image_path)} | Shape: {img.shape}")
     return img
 
 
@@ -42,7 +47,7 @@ def to_grayscale(img: np.ndarray) -> np.ndarray:
     Grayscale is all we need for crack detection — color info not needed.
     """
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    print(f"[✓] Grayscale conversion done | Shape: {gray.shape}")
+    print(f"[OK] Grayscale conversion done | Shape: {gray.shape}")
     return gray
 
 
@@ -59,7 +64,7 @@ def reduce_noise(gray: np.ndarray, ksize: int = 9) -> np.ndarray:
         without destroying crack edges (unlike median blur).
     """
     blurred = cv2.GaussianBlur(gray, (ksize, ksize), sigmaX=0)
-    print(f"[✓] Gaussian blur applied (kernel={ksize}x{ksize})")
+    print(f"[OK] Gaussian blur applied (kernel={ksize}x{ksize})")
     return blurred
 
 
@@ -81,7 +86,7 @@ def enhance_contrast(gray: np.ndarray,
     """
     clahe = cv2.createCLAHE(clipLimit=clip_limit, tileGridSize=tile_grid_size)
     enhanced = clahe.apply(gray)
-    print(f"[✓] CLAHE contrast enhancement done (clip={clip_limit})")
+    print(f"[OK] CLAHE contrast enhancement done (clip={clip_limit})")
     return enhanced
 
 
@@ -114,7 +119,7 @@ def adaptive_threshold(enhanced: np.ndarray,
         blockSize=block_size,
         C=C
     )
-    print(f"[✓] Adaptive thresholding done (block={block_size}, C={C})")
+    print(f"[OK] Adaptive thresholding done (block={block_size}, C={C})")
     return binary
 
 
@@ -142,7 +147,7 @@ def morphological_cleanup(binary: np.ndarray) -> np.ndarray:
     # Step 3: Remove small connected components (area < min_area are noise)
     mask = _remove_small_components(closed, min_area=300)  # 300px² is roughly a 17x17 region
     
-    print(f"[✓] Morphological cleanup done")
+    print(f"[OK] Morphological cleanup done")
     return mask
 
 
@@ -165,7 +170,7 @@ def _remove_small_components(binary: np.ndarray, min_area: int = 100) -> np.ndar
             output[labels == label] = 255
             kept += 1
     
-    print(f"   → Connected components: {num_labels - 1} found, {kept} kept (area ≥ {min_area}px)")
+    print(f"   -> Connected components: {num_labels - 1} found, {kept} kept (area >= {min_area}px)")
     return output
 
 
@@ -220,7 +225,7 @@ def run_preprocessing_pipeline(image_path: str,
         cv2.imwrite(os.path.join(output_dir, f"{base_name}_03_enhanced.jpg"),  enhanced)
         cv2.imwrite(os.path.join(output_dir, f"{base_name}_04_binary.jpg"),    binary)
         cv2.imwrite(os.path.join(output_dir, f"{base_name}_05_crack_mask.jpg"), crack_mask)
-        print(f"\n[✓] All step images saved to: {output_dir}")
+        print(f"\n[OK] All step images saved to: {output_dir}")
     
     # --- Summary ---
     crack_pixels = np.sum(crack_mask > 0)
@@ -253,12 +258,12 @@ def visualize_results(results: dict, save_path: str = None):
     
     # Plot config: (title, image, colormap)
     plots = [
-        ("① Original Image",         cv2.cvtColor(results['original'], cv2.COLOR_BGR2RGB), None),
-        ("② Grayscale",               results['gray'],       'gray'),
-        ("③ Noise Reduction (Blur)",  results['blurred'],    'gray'),
-        ("④ CLAHE Enhancement",       results['enhanced'],   'gray'),
-        ("⑤ Adaptive Threshold",      results['binary'],     'gray'),
-        ("⑥ Crack Mask (Final)",      results['crack_mask'], 'gray'),
+        ("1. Original Image",         cv2.cvtColor(results['original'], cv2.COLOR_BGR2RGB), None),
+        ("2. Grayscale",               results['gray'],       'gray'),
+        ("3. Noise Reduction (Blur)",  results['blurred'],    'gray'),
+        ("4. CLAHE Enhancement",       results['enhanced'],   'gray'),
+        ("5. Adaptive Threshold",      results['binary'],     'gray'),
+        ("6. Crack Mask (Final)",      results['crack_mask'], 'gray'),
     ]
     
     axes = [fig.add_subplot(gs[i//3, i%3]) for i in range(6)]
@@ -277,13 +282,13 @@ def visualize_results(results: dict, save_path: str = None):
                 ha='center', fontsize=9, color='gray')
     
     # Highlight the final crack mask panel
-    axes[5].set_title("⑥ Crack Mask (Final) ✓", 
+    axes[5].set_title("6. Crack Mask (Final)", 
                        fontsize=11, fontweight='bold', color='#e74c3c', pad=8)
     
     if save_path:
         plt.savefig(save_path, dpi=150, bbox_inches='tight', 
                     facecolor='white', edgecolor='none')
-        print(f"[✓] Visualization saved: {save_path}")
+        print(f"[OK] Visualization saved: {save_path}")
         plt.close()
     else:
         plt.show()
