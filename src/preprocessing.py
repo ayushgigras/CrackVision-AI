@@ -207,6 +207,8 @@ def run_preprocessing_pipeline(image_path: str,
     crack_mask = morphological_cleanup(binary)
     
     results = {
+        'image_name': os.path.splitext(os.path.basename(image_path))[0],
+        'image_path': image_path,
         'original':   original,
         'gray':       gray,
         'blurred':    blurred,
