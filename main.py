@@ -70,6 +70,9 @@ def process_single_image(image_path: str, output_dir: str, args):
     meas_results = run_measurement_pipeline(
         segmentation_results=seg_results,
         output_dir=output_dir,
+        gap_closing_ksize=getattr(args, 'gap_closing_ksize', 7),
+        gap_closing_iters=getattr(args, 'gap_closing_iters', 1),
+        enable_gap_closing=(getattr(args, 'gap_closing_ksize', 7) > 1),
         save_steps=True
     )
     
@@ -149,6 +152,18 @@ Examples:
         help='Mask fusion mode (default: frangi_primary)'
     )
     parser.add_argument(
+        '--gap-closing-ksize',
+        type=int,
+        default=7,
+        help='Kernel size for Step 4A morphological gap-closing (default: 7, 0 or 1 to disable)'
+    )
+    parser.add_argument(
+        '--gap-closing-iters',
+        type=int,
+        default=1,
+        help='Iterations for Step 4A morphological gap-closing (default: 1)'
+    )
+    parser.add_argument(
         '--show',
         action='store_true',
         help='Display visualization window (requires display)'
@@ -196,21 +211,23 @@ Examples:
         all_reports.append(res)
         
     # --- Print Final Summary Report ---
-    print("\n" + "="*120)
+    print("\n" + "="*125)
     print("  CrackGauge Pipeline Execution Summary (Steps 1, 2, 3, 4A, 4B)")
-    print("="*120)
-    print(f"{'Image Name':<20} | {'Crack %':<8} | {'Comps':<6} | {'Total Length':<13} | {'Max Width':<10} | {'Dominant Angle':<15} | {'Classification':<18}")
-    print("-" * 120)
+    print("="*125)
+    print(f"{'Image Name':<20} | {'Crack %':<8} | {'Comps (Raw)':<13} | {'Total Length':<13} | {'Max Width':<10} | {'Dominant Angle':<15} | {'Classification':<18}")
+    print("-" * 125)
     for rep in all_reports:
         name = rep['image_name']
         cp_pct = rep['seg']['crack_percent']
         tot_len = rep['meas']['total_length_px']
         n_comps = rep['meas']['component_count']
+        n_raw = rep['meas'].get('raw_component_count', n_comps)
+        comps_str = f"{n_comps} (raw {n_raw})" if n_raw != n_comps else f"{n_comps}"
         max_w = rep['meas']['max_width_px']
         dom_ang = rep['meas']['dominant_angle_deg']
         dom_type = rep['meas']['dominant_type']
-        print(f"{name:<20} | {cp_pct:>7.2f}% | {n_comps:>6d} | {tot_len:>10.1f} px | {max_w:>8.2f} px | {dom_ang:>12.1f} deg | {dom_type:<18}")
-    print("="*120)
+        print(f"{name:<20} | {cp_pct:>7.2f}% | {comps_str:>13} | {tot_len:>10.1f} px | {max_w:>8.2f} px | {dom_ang:>12.1f} deg | {dom_type:<18}")
+    print("="*125)
     print("  * Note: Width/Length in PIXELS, Orientation in DEGREES relative to horizontal [0, 180). Calibration pending Step 5.")
     
     # Detailed Component Breakdown (Length + PCA Orientation)
@@ -220,8 +237,10 @@ Examples:
     for rep in all_reports:
         name = rep['image_name']
         comps = rep['meas']['components']
+        n_raw = rep['meas'].get('raw_component_count', len(comps))
+        raw_note = f" (reduced from {n_raw} raw fragments via gap-closing)" if n_raw != len(comps) else ""
         orients = {c['id']: c for c in rep['meas'].get('component_orientations', [])}
-        print(f"\n  [{name}] - {len(comps)} component(s):")
+        print(f"\n  [{name}] - {len(comps)} component(s){raw_note}:")
         for c in comps:
             cid = c['id']
             clen = c['length_px']

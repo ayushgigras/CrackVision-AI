@@ -232,10 +232,18 @@ def create_width_visualization_image(original_bgr: np.ndarray,
 # ==============================================================================
 
 def measure_crack_lengths(crack_mask: np.ndarray,
-                          skeleton: np.ndarray = None) -> dict:
+                          skeleton: np.ndarray = None,
+                          gap_closing_ksize: int = 7,
+                          gap_closing_iters: int = 1,
+                          enable_gap_closing: bool = True) -> dict:
     """
     Calculate total crack length and per-component crack lengths in pixels from the skeleton.
     
+    Morphological Preprocessing (Gap-Closing):
+        Before connected component labeling, applies a conservative morphological closing
+        operation (ellipse kernel) to join artificial micro-gaps in the synthetic segmentation mask.
+        The skeleton is then recomputed on the closed mask to provide a continuous medial path.
+        
     Path Length Calculation:
         For each connected component, adjacent 8-connected skeleton pixels are traversed:
           - Orthogonal neighbor step: distance = 1.0 px
@@ -243,39 +251,59 @@ def measure_crack_lengths(crack_mask: np.ndarray,
         Undirected neighbor edges are summed to obtain the true path length in pixels.
         
     Args:
-        crack_mask: Binary crack mask (uint8)
-        skeleton:   Optional precomputed 1-pixel wide skeleton (uint8)
+        crack_mask:          Binary crack mask (uint8)
+        skeleton:            Optional precomputed 1-pixel wide skeleton (uint8)
+        gap_closing_ksize:   Kernel size for closing (default: 7, ellipse). Set <= 1 to disable.
+        gap_closing_iters:   Iterations of morphological closing (default: 1)
+        enable_gap_closing:  Flag to enable/disable gap closing (default: True)
         
     Returns:
         dict containing:
-            'total_length_px':  float, sum of all component lengths in pixels
-            'component_count':  int, number of crack components
-            'components':       list of dicts for each component:
-                {
-                    'id':              int (1-based),
-                    'length_px':       float,
-                    'skeleton_pixels': int,
-                    'mask_area':       int,
-                    'centroid':        tuple (cx, cy),
-                    'bbox':            tuple (x, y, w, h)
-                }
+            'total_length_px':      float, sum of all component lengths in pixels
+            'component_count':      int, number of crack components after gap closing
+            'raw_component_count':  int, number of crack components before gap closing
+            'components':           list of dicts for each component
+            'closed_mask':          np.ndarray, binary mask after gap closing
+            'length_skeleton':      np.ndarray, recalculated skeleton on closed mask
+            'gap_closing_ksize':    int
+            'gap_closing_iters':    int
     """
     if crack_mask is None or np.sum(crack_mask > 127) == 0:
         print("[INFO] No crack pixels found for length measurement. Total length set to 0.0 px.")
+        empty_mask = np.zeros((1, 1), dtype=np.uint8) if crack_mask is None else np.zeros_like(crack_mask)
         return {
             'total_length_px': 0.0,
             'component_count': 0,
+            'raw_component_count': 0,
             'components': [],
+            'closed_mask': empty_mask,
+            'length_skeleton': empty_mask,
+            'gap_closing_ksize': gap_closing_ksize if enable_gap_closing else 0,
+            'gap_closing_iters': gap_closing_iters if enable_gap_closing else 0,
         }
         
-    if skeleton is None:
-        skeleton = compute_skeleton(crack_mask)
-        
-    mask_bin = (crack_mask > 127).astype(np.uint8)
-    skel_bool = skeleton > 0
+    raw_mask_bin = (crack_mask > 127).astype(np.uint8)
     
-    # Label connected components on mask
-    num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(mask_bin, connectivity=8)
+    # Count raw components before gap closing
+    num_raw_labels, _, _, _ = cv2.connectedComponentsWithStats(raw_mask_bin, connectivity=8)
+    raw_component_count = max(0, num_raw_labels - 1)
+    
+    # Morphological gap-closing (conservative)
+    if enable_gap_closing and gap_closing_ksize > 1:
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (gap_closing_ksize, gap_closing_ksize))
+        closed_mask = cv2.morphologyEx(raw_mask_bin * 255, cv2.MORPH_CLOSE, kernel, iterations=gap_closing_iters)
+        # Recalculate skeleton on the closed mask
+        recalculated_skeleton = compute_skeleton(closed_mask)
+        eval_mask_bin = (closed_mask > 127).astype(np.uint8)
+    else:
+        closed_mask = crack_mask.copy()
+        recalculated_skeleton = skeleton if skeleton is not None else compute_skeleton(crack_mask)
+        eval_mask_bin = raw_mask_bin
+        
+    skel_bool = recalculated_skeleton > 0
+    
+    # Label connected components on the evaluated mask
+    num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(eval_mask_bin, connectivity=8)
     
     # 4 forward directions for undirected edge counting: (dy, dx, distance)
     fwd_dirs = [
@@ -331,11 +359,19 @@ def measure_crack_lengths(crack_mask: np.ndarray,
         })
         comp_idx += 1
         
+    if enable_gap_closing and gap_closing_ksize > 1:
+        print(f"[INFO] Step 4A Gap Closing: {raw_component_count} raw component(s) -> {len(components)} continuous component(s) (kernel={gap_closing_ksize}x{gap_closing_ksize}, iters={gap_closing_iters})")
     print(f"[OK] Length calculation completed: {len(components)} components | Total Length: {total_length:.2f} px")
+    
     return {
         'total_length_px': total_length,
         'component_count': len(components),
+        'raw_component_count': raw_component_count,
         'components': components,
+        'closed_mask': closed_mask,
+        'length_skeleton': recalculated_skeleton,
+        'gap_closing_ksize': gap_closing_ksize if enable_gap_closing else 0,
+        'gap_closing_iters': gap_closing_iters if enable_gap_closing else 0,
     }
 
 
@@ -343,12 +379,14 @@ def create_length_visualization_image(original_bgr: np.ndarray,
                                       crack_mask: np.ndarray,
                                       skeleton: np.ndarray,
                                       components: list,
-                                      total_length_px: float) -> np.ndarray:
+                                      total_length_px: float,
+                                      raw_component_count: int = None) -> np.ndarray:
     """
     Generate an annotated image highlighting each crack component's path in distinct colors
-    with component ID and length callout badges.
+    with non-overlapping component ID and length callout badges, connected via leader lines.
     """
     vis = original_bgr.copy()
+    img_h, img_w = vis.shape[:2]
     
     if not components or skeleton is None or np.sum(skeleton > 0) == 0:
         return vis
@@ -357,13 +395,13 @@ def create_length_visualization_image(original_bgr: np.ndarray,
     PALETTE = [
         (0, 255, 255),    # Yellow
         (0, 255, 0),      # Lime Green
-        (255, 128, 0),    # Orange/Cyan
+        (255, 128, 0),    # Blue-Cyan / Sky
         (255, 0, 255),    # Magenta
         (0, 165, 255),    # Orange
         (255, 255, 0),    # Cyan
         (128, 0, 255),    # Violet
         (0, 215, 255),    # Gold
-        (50, 205, 50),    # Lime
+        (50, 205, 50),    # Forest Lime
         (255, 192, 203),  # Pink
         (220, 20, 60),    # Crimson
         (0, 128, 255),    # Amber
@@ -376,45 +414,137 @@ def create_length_visualization_image(original_bgr: np.ndarray,
     
     kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
     
-    comp_map = {c['id']: c for c in components}
+    # 1. Draw colored skeleton paths
     actual_idx = 1
-    
     for label in range(1, num_labels):
         comp_skel_mask = (labels == label) & skel_bool
         if not np.any(comp_skel_mask):
             continue
             
         color = PALETTE[(actual_idx - 1) % len(PALETTE)]
-        
-        # Dilate component skeleton for crisp visibility
         dilated = cv2.dilate(comp_skel_mask.astype(np.uint8), kernel, iterations=1) > 0
         vis[dilated] = color
-        
-        # Add badge text near centroid if component is significant
-        if actual_idx in comp_map:
-            cdata = comp_map[actual_idx]
-            cx, cy = cdata['centroid']
-            clen = cdata['length_px']
-            
-            # Badge text
-            badge = f"#{actual_idx}: {clen:.1f}px"
-            tx = int(np.clip(cx + 8, 10, original_bgr.shape[1] - 120))
-            ty = int(np.clip(cy - 8, 20, original_bgr.shape[0] - 10))
-            
-            # Small dark background for text readability
-            (tw, th), _ = cv2.getTextSize(badge, cv2.FONT_HERSHEY_SIMPLEX, 0.45, 1)
-            cv2.rectangle(vis, (tx - 3, ty - th - 3), (tx + tw + 3, ty + 3), (20, 20, 20), -1)
-            cv2.rectangle(vis, (tx - 3, ty - th - 3), (tx + tw + 3, ty + 3), color, 1)
-            cv2.putText(vis, badge, (tx, ty), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1, cv2.LINE_AA)
-            
         actual_idx += 1
         
+    # 2. Collision-free badge placement with leader lines
+    placed_boxes = []  # list of (x1, y1, x2, y2)
+    
+    candidate_offsets = [
+        (14, -14),
+        (14, 20),
+        (-14, -14),
+        (-14, 20),
+        (0, -32),
+        (0, 32),
+        (35, -5),
+        (-35, -5),
+        (35, 25),
+        (-35, 25),
+        (50, -20),
+        (-50, -20),
+        (50, 40),
+        (-50, 40),
+        (0, -50),
+        (0, 50),
+        (70, 0),
+        (-70, 0),
+        (70, 35),
+        (-70, 35),
+    ]
+    
+    for c in components:
+        idx = c['id']
+        color = PALETTE[(idx - 1) % len(PALETTE)]
+        cx, cy = c['centroid']
+        clen = c['length_px']
+        
+        badge_text = f"#{idx}: {clen:.1f}px"
+        font_scale = 0.42
+        thickness = 1
+        (tw, th), _ = cv2.getTextSize(badge_text, cv2.FONT_HERSHEY_SIMPLEX, font_scale, thickness)
+        bw = tw + 10
+        bh = th + 8
+        
+        best_box = None
+        best_score = float('inf')
+        
+        for ox, oy in candidate_offsets:
+            if ox < 0:
+                bx = int(cx + ox - bw)
+            elif ox == 0:
+                bx = int(cx - bw // 2)
+            else:
+                bx = int(cx + ox)
+                
+            if oy < 0:
+                by = int(cy + oy - bh)
+            else:
+                by = int(cy + oy)
+                
+            # Clamp inside image boundaries (reserve top y=45 for HUD banner)
+            bx = max(10, min(bx, img_w - bw - 10))
+            by = max(45, min(by, img_h - bh - 10))
+            box = (bx, by, bx + bw, by + bh)
+            
+            # Check overlap area with already placed badges (plus 3px padding)
+            overlap_area = 0
+            for pbox in placed_boxes:
+                ix1 = max(box[0] - 3, pbox[0] - 3)
+                iy1 = max(box[1] - 3, pbox[1] - 3)
+                ix2 = min(box[2] + 3, pbox[2] + 3)
+                iy2 = min(box[3] + 3, pbox[3] + 3)
+                if ix2 > ix1 and iy2 > iy1:
+                    overlap_area += (ix2 - ix1) * (iy2 - iy1)
+                    
+            box_cx = bx + bw / 2.0
+            box_cy = by + bh / 2.0
+            dist = np.hypot(box_cx - cx, box_cy - cy)
+            
+            score = (overlap_area * 1000.0) + dist
+            if score < best_score:
+                best_score = score
+                best_box = box
+                
+        if best_box is None:
+            bx = max(10, min(int(cx), img_w - bw - 10))
+            by = max(45, min(int(cy), img_h - bh - 10))
+            best_box = (bx, by, bx + bw, by + bh)
+            
+        placed_boxes.append(best_box)
+        bx, by, bx2, by2 = best_box
+        
+        # Leader line from centroid to badge anchor
+        anchor_x = int(np.clip(cx, bx, bx2))
+        anchor_y = int(np.clip(cy, by, by2))
+        
+        # Centroid marker dot
+        cv2.circle(vis, (int(round(cx)), int(round(cy))), 3, (20, 20, 20), -1)
+        cv2.circle(vis, (int(round(cx)), int(round(cy))), 2, color, -1)
+        
+        # Draw leader line if badge is offset from centroid
+        if np.hypot(anchor_x - cx, anchor_y - cy) > 5:
+            cv2.line(vis, (int(round(cx)), int(round(cy))), (anchor_x, anchor_y), (40, 40, 40), 2, cv2.LINE_AA)
+            cv2.line(vis, (int(round(cx)), int(round(cy))), (anchor_x, anchor_y), color, 1, cv2.LINE_AA)
+            
+        # Draw badge box
+        cv2.rectangle(vis, (bx, by), (bx2, by2), (20, 20, 20), -1)
+        cv2.rectangle(vis, (bx, by), (bx2, by2), color, 1, cv2.LINE_AA)
+        
+        # Badge text
+        tx = bx + 5
+        ty = by + th + 4
+        cv2.putText(vis, badge_text, (tx, ty), cv2.FONT_HERSHEY_SIMPLEX, font_scale, (255, 255, 255), thickness, cv2.LINE_AA)
+        
     # Top HUD banner with overall length summary
-    hud_text = f"Total Crack Length: {total_length_px:.1f} px  |  Components: {len(components)}"
-    (hw, hh), _ = cv2.getTextSize(hud_text, cv2.FONT_HERSHEY_SIMPLEX, 0.65, 2)
-    cv2.rectangle(vis, (10, 10), (10 + hw + 20, 10 + hh + 16), (20, 20, 20), -1)
-    cv2.rectangle(vis, (10, 10), (10 + hw + 20, 10 + hh + 16), (0, 200, 255), 2)
-    cv2.putText(vis, hud_text, (20, 10 + hh + 8), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 255, 255), 2, cv2.LINE_AA)
+    if raw_component_count is not None and raw_component_count != len(components):
+        hud_text = f"Total Crack Length: {total_length_px:.1f} px  |  Components: {len(components)} (Raw: {raw_component_count}, Gap-Closed)"
+    else:
+        hud_text = f"Total Crack Length: {total_length_px:.1f} px  |  Components: {len(components)}"
+        
+    (hw, hh), _ = cv2.getTextSize(hud_text, cv2.FONT_HERSHEY_SIMPLEX, 0.58, 2)
+    cv2.rectangle(vis, (10, 8), (10 + hw + 20, 8 + hh + 16), (20, 20, 20), -1)
+    cv2.rectangle(vis, (10, 8), (10 + hw + 20, 8 + hh + 16), (0, 200, 255), 2)
+    cv2.putText(vis, hud_text, (20, 8 + hh + 8), cv2.FONT_HERSHEY_SIMPLEX, 0.58, (0, 255, 255), 2, cv2.LINE_AA)
     
     return vis
 
@@ -647,6 +777,9 @@ def create_orientation_visualization_image(original_bgr: np.ndarray,
 def run_measurement_pipeline(segmentation_results: dict,
                              output_dir: str = None,
                              min_orientation_points: int = 30,
+                             gap_closing_ksize: int = 7,
+                             gap_closing_iters: int = 1,
+                             enable_gap_closing: bool = True,
                              save_steps: bool = True) -> dict:
     """
     Execute Step 3 (Width), Step 4A (Length), and Step 4B (Orientation) Pipeline on segmentation results.
@@ -655,6 +788,9 @@ def run_measurement_pipeline(segmentation_results: dict,
         segmentation_results:    Output dict from segmentation.py
         output_dir:              Directory to save output files
         min_orientation_points:  Minimum component points for PCA orientation analysis
+        gap_closing_ksize:       Kernel size for Step 4A morphological closing (default: 7)
+        gap_closing_iters:       Iterations of Step 4A morphological closing (default: 1)
+        enable_gap_closing:      Whether to enable Step 4A gap closing (default: True)
         save_steps:              Whether to save images to disk
         
     Returns:
@@ -667,32 +803,43 @@ def run_measurement_pipeline(segmentation_results: dict,
     original = segmentation_results['original']
     final_mask = segmentation_results['final_mask']
     
-    # 1. Skeletonize
+    # 1. Skeletonize (Step 3 Medial Axis)
     skeleton = compute_skeleton(final_mask)
     
-    # 2. Distance Transform
+    # 2. Distance Transform (Step 3)
     dist_transform = compute_distance_transform(final_mask)
     
-    # 3. Measure Widths (Step 3)
+    # 3. Measure Widths (Step 3) - Strictly preserves existing calculations
     width_stats = measure_crack_widths(final_mask, skeleton, dist_transform)
     
-    # 4. Measure Lengths (Step 4A)
-    length_stats = measure_crack_lengths(final_mask, skeleton)
+    # 4. Measure Lengths (Step 4A) - With configurable morphological gap-closing & re-skeletonization
+    length_stats = measure_crack_lengths(
+        final_mask,
+        skeleton,
+        gap_closing_ksize=gap_closing_ksize,
+        gap_closing_iters=gap_closing_iters,
+        enable_gap_closing=enable_gap_closing
+    )
     
-    # 5. Measure Orientation via PCA (Step 4B)
+    # 5. Measure Orientation via PCA (Step 4B) - Strictly preserves existing calculations
     orientation_stats = measure_crack_orientations(final_mask, min_points=min_orientation_points)
     
-    # 6. Width Heatmap Image
+    # 6. Width Heatmap Image (Step 3)
     width_vis = create_width_visualization_image(
         original, skeleton, width_stats['width_map'], width_stats['max_width_coords']
     )
     
-    # 7. Length Component Image
+    # 7. Length Component Image (Step 4A, non-overlapping badges on closed mask & recomputed skeleton)
     length_vis = create_length_visualization_image(
-        original, final_mask, skeleton, length_stats['components'], length_stats['total_length_px']
+        original,
+        length_stats['closed_mask'],
+        length_stats['length_skeleton'],
+        length_stats['components'],
+        length_stats['total_length_px'],
+        raw_component_count=length_stats['raw_component_count']
     )
     
-    # 8. Orientation PCA Image
+    # 8. Orientation PCA Image (Step 4B)
     orientation_vis = create_orientation_visualization_image(
         original, final_mask, skeleton, orientation_stats
     )
@@ -700,7 +847,9 @@ def run_measurement_pipeline(segmentation_results: dict,
     results = {
         'original':                   original,
         'final_mask':                 final_mask,
+        'closed_mask':                length_stats['closed_mask'],
         'skeleton':                   skeleton,
+        'length_skeleton':            length_stats['length_skeleton'],
         'dist_transform':             dist_transform,
         'width_map':                  width_stats['width_map'],
         'width_vis':                  width_vis,
@@ -711,9 +860,11 @@ def run_measurement_pipeline(segmentation_results: dict,
         'median_width_px':            width_stats['median_width_px'],
         'std_width_px':               width_stats['std_width_px'],
         'skeleton_points':            width_stats['skeleton_points'],
+        'length_skeleton_points':     int(np.sum(length_stats['length_skeleton'] > 0)),
         'max_width_coords':           width_stats['max_width_coords'],
         'total_length_px':            length_stats['total_length_px'],
         'component_count':            length_stats['component_count'],
+        'raw_component_count':        length_stats['raw_component_count'],
         'components':                 length_stats['components'],
         'dominant_angle_deg':         orientation_stats['dominant_angle_deg'],
         'dominant_type':              orientation_stats['dominant_type'],
@@ -747,7 +898,12 @@ def run_measurement_pipeline(segmentation_results: dict,
     print(f"\n{'='*60}")
     print(f"  Measurement Summary (PIXELS & DEGREES):")
     print(f"  Total Crack Length  : {length_stats['total_length_px']:.2f} px")
-    print(f"  Crack Components    : {length_stats['component_count']}")
+    n_raw = length_stats['raw_component_count']
+    n_closed = length_stats['component_count']
+    if n_raw != n_closed:
+        print(f"  Crack Components    : {n_closed} (reduced from {n_raw} raw fragments via gap closing)")
+    else:
+        print(f"  Crack Components    : {n_closed}")
     print(f"  Max Width           : {width_stats['max_width_px']:.2f} px")
     print(f"  Mean Width          : {width_stats['mean_width_px']:.2f} px")
     print(f"  Dominant Orientation: {orientation_stats['dominant_angle_deg']:.1f} deg ({orientation_stats['dominant_type']})")
@@ -842,11 +998,17 @@ def visualize_length_measurement(results: dict, save_path: str = None):
     
     # Panel 3: Skeleton
     ax3 = fig.add_subplot(gs[1, 0])
-    ax3.imshow(results['skeleton'], cmap='hot')
+    len_skel = results.get('length_skeleton', results['skeleton'])
+    ax3.imshow(len_skel, cmap='hot')
     tot_len = results.get('total_length_px', 0.0)
     n_comp = results.get('component_count', 0)
-    ax3.set_title(f"3. Crack Skeleton ({results['skeleton_points']:,} px | {n_comp} Components)",
-                  fontsize=11, fontweight='bold', pad=8)
+    n_raw = results.get('raw_component_count', n_comp)
+    skel_pts = results.get('length_skeleton_points', results.get('skeleton_points', 0))
+    if n_raw != n_comp:
+        panel3_title = f"3. Recalculated Skeleton ({skel_pts:,} px | {n_raw} -> {n_comp} Components)"
+    else:
+        panel3_title = f"3. Crack Skeleton ({skel_pts:,} px | {n_comp} Components)"
+    ax3.set_title(panel3_title, fontsize=11, fontweight='bold', pad=8)
     ax3.axis('off')
     
     # Panel 4: Length Measurement Vis
