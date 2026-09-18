@@ -242,7 +242,10 @@ def run_segmentation_pipeline(preprocessed_results: dict,
     total_pixels = int(final_mask.shape[0] * final_mask.shape[1])
     crack_percent = (crack_pixels / total_pixels) * 100.0
     
+    base_name = preprocessed_results.get('image_name', 'crack_result')
+    
     results = {
+        'image_name':      base_name,
         'original':        original,
         'enhanced':        enhanced,
         'adaptive_mask':   adaptive_mask,

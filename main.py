@@ -23,10 +23,11 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'src'))
 
 from preprocessing import run_preprocessing_pipeline, visualize_results
 from segmentation import run_segmentation_pipeline, visualize_segmentation
+from measurement import run_measurement_pipeline, visualize_measurement
 
 
 def process_single_image(image_path: str, output_dir: str, args):
-    """Process a single crack image through Step 1 (Preprocessing) and Step 2 (Segmentation)."""
+    """Process a single crack image through Step 1 (Preprocessing), Step 2 (Segmentation), and Step 3 (Width Measurement)."""
     base_name = os.path.splitext(os.path.basename(image_path))[0]
     
     # --- Step 1: Preprocessing ---
@@ -58,13 +59,26 @@ def process_single_image(image_path: str, output_dir: str, args):
     viz_seg_path = os.path.join(output_dir, f"{base_name}_segmentation_viz.png")
     visualize_segmentation(seg_results, save_path=viz_seg_path)
     
+    # --- Step 3: Crack Width Measurement (Medial Axis & Distance Transform) ---
+    meas_results = run_measurement_pipeline(
+        segmentation_results=seg_results,
+        output_dir=output_dir,
+        save_steps=True
+    )
+    
+    # Save Step 3 Visualization
+    viz_meas_path = os.path.join(output_dir, f"{base_name}_measurement_viz.png")
+    visualize_measurement(meas_results, save_path=viz_meas_path)
+    
     return {
         'image_name': base_name,
         'image_path': image_path,
-        'prep': prep_results,
-        'seg': seg_results,
-        'prep_viz': viz_prep_path,
-        'seg_viz': viz_seg_path,
+        'prep':       prep_results,
+        'seg':        seg_results,
+        'meas':       meas_results,
+        'prep_viz':   viz_prep_path,
+        'seg_viz':    viz_seg_path,
+        'meas_viz':   viz_meas_path,
     }
 
 
@@ -165,27 +179,28 @@ Examples:
         all_reports.append(res)
         
     # --- Print Final Summary Report ---
-    print("\n" + "="*80)
-    print("  CrackGauge Pipeline Execution Summary (Step 1 + Step 2)")
-    print("="*80)
-    print(f"{'Image Name':<25} | {'Prep Coverage':<14} | {'Ridge Max':<10} | {'Crack Pixels':<13} | {'Crack %':<8}")
-    print("-" * 80)
+    print("\n" + "="*95)
+    print("  CrackGauge Pipeline Execution Summary (Steps 1 + 2 + 3)")
+    print("="*95)
+    print(f"{'Image Name':<22} | {'Crack %':<8} | {'Skeleton Pts':<13} | {'Max Width':<11} | {'Mean Width':<11} | {'Median Width':<12}")
+    print("-" * 95)
     for rep in all_reports:
         name = rep['image_name']
-        prep_mask = rep['prep']['crack_mask']
-        prep_pct = (np.sum(prep_mask > 0) / prep_mask.size) * 100.0
-        r_max = float(rep['seg']['ridge_float'].max())
-        cp = rep['seg']['crack_pixels']
         cp_pct = rep['seg']['crack_percent']
-        print(f"{name:<25} | {prep_pct:>12.2f}% | {r_max:>10.4f} | {cp:>11,d}px | {cp_pct:>6.2f}%")
-    print("="*80)
+        sk_pts = rep['meas']['skeleton_points']
+        max_w = rep['meas']['max_width_px']
+        mean_w = rep['meas']['mean_width_px']
+        med_w = rep['meas']['median_width_px']
+        print(f"{name:<22} | {cp_pct:>7.2f}% | {sk_pts:>11,d}px | {max_w:>9.2f}px | {mean_w:>10.2f}px | {med_w:>11.2f}px")
+    print("="*95)
+    print("  * Note: All widths are reported in PIXELS (calibrated mm conversion pending Step 4).")
     
     if args.show:
         import matplotlib.pyplot as plt
         plt.show()
         
     print(f"\n[SUCCESS] Pipeline complete! Output directory: {args.output}/")
-    print("Step 1 (Preprocessing) + Step 2 (Hessian/Frangi Segmentation) verified.")
+    print("Steps verified: Step 1 (Preprocessing) -> Step 2 (Segmentation) -> Step 3 (Width Measurement).")
 
 
 if __name__ == "__main__":
