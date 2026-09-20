@@ -684,23 +684,35 @@ def measure_crack_orientations(crack_mask: np.ndarray,
         })
         comp_idx += 1
         
-    # Dominant orientation across all crack pixels
+    # Dominant orientation across all crack pixels (PCA on full crack mask)
     if len(all_xs) >= 3:
         all_pts = np.column_stack((all_xs, all_ys))
         overall_pca = compute_pca_orientation(all_pts)
         dom_angle = overall_pca['angle_deg']
         dom_type = overall_pca['orientation_type']
+        dom_center = overall_pca['center']
+        dom_eigenvector = overall_pca['eigenvector']
+        dom_eigenvalues = overall_pca['eigenvalues']
     else:
         dom_angle = 0.0
         dom_type = 'Undetermined'
-        
+        dom_center = (0.0, 0.0)
+        dom_eigenvector = np.array([1.0, 0.0], dtype=np.float32)
+        dom_eigenvalues = (0.0, 0.0)
+
+    # Debug: per-component summary (terminal only, not on visualization)
     print(f"[OK] PCA orientation analysis complete: {len(components)} meaningful components evaluated.")
+    for c in components:
+        print(f"     Comp #{c['id']:2d}: {c['angle_deg']:.1f} deg ({c['orientation_type']}) | {c['points_count']} px")
     print(f"     Dominant Orientation: {dom_angle:.1f} deg ({dom_type})")
-    
+
     return {
         'components': components,
         'dominant_angle_deg': dom_angle,
         'dominant_type': dom_type,
+        'dominant_center': dom_center,
+        'dominant_eigenvector': dom_eigenvector,
+        'dominant_eigenvalues': dom_eigenvalues,
         'evaluated_component_count': len(components),
     }
 
@@ -710,67 +722,97 @@ def create_orientation_visualization_image(original_bgr: np.ndarray,
                                            skeleton: np.ndarray,
                                            orientations_data: dict) -> np.ndarray:
     """
-    Generate an annotated image drawing PCA principal axes and orientation angle badges
-    on the original image with cracks.
+    Generate a clean visualization of the DOMINANT PCA orientation only.
+
+    Design:
+    - Draws a subtle red overlay on all crack pixels.
+    - Draws ONE prominent orientation axis representing the full-image dominant PCA result.
+    - Axis runs across the entire image (not just the component bounding box) so it is
+      readable at 800x600 resolution without any per-component clutter.
+    - A single center-point marker at the PCA centroid.
+    - Top HUD banner: dominant angle, structural type, and component count.
+    - No per-component axes or badge labels are drawn on the image.
+      (Per-component results are available in terminal output.)
     """
     vis = original_bgr.copy()
-    
+    img_h, img_w = vis.shape[:2]
+
     if crack_mask is None or np.sum(crack_mask > 127) == 0:
         return vis
-        
-    # Subtle overlay of crack mask
+
+    # --- Crack mask overlay (subtle red tint) ---
     mask_bin = crack_mask > 127
     vis[mask_bin] = cv2.addWeighted(
-        original_bgr[mask_bin], 0.35, np.full_like(original_bgr[mask_bin], (0, 0, 255)), 0.65, 0
+        original_bgr[mask_bin], 0.35,
+        np.full_like(original_bgr[mask_bin], (0, 0, 255)), 0.65, 0
     )
-    
-    # Color palette for axes and badges
-    PALETTE = [
-        (0, 255, 255),    # Yellow
-        (0, 255, 0),      # Lime Green
-        (255, 128, 0),    # Orange/Cyan
-        (255, 0, 255),    # Magenta
-        (0, 165, 255),    # Orange
-        (255, 255, 0),    # Cyan
-        (128, 0, 255),    # Violet
-        (0, 215, 255),    # Gold
-    ]
-    
-    components = orientations_data.get('components', [])
-    
-    for c in components:
-        idx = c['id']
-        color = PALETTE[(idx - 1) % len(PALETTE)]
-        p1, p2 = c['endpoints']
-        cx, cy = int(round(c['center'][0])), int(round(c['center'][1]))
-        
-        # Draw PCA Principal Axis line (thick with dark outline for contrast)
-        cv2.line(vis, p1, p2, (20, 20, 20), 4, cv2.LINE_AA)
-        cv2.line(vis, p1, p2, color, 2, cv2.LINE_AA)
-        
-        # Draw centroid marker
-        cv2.circle(vis, (cx, cy), 6, (20, 20, 20), -1)
-        cv2.circle(vis, (cx, cy), 4, color, -1)
-        
-        # Badge annotation: "#ID: XX.X° (Type)"
-        badge = f"#{idx}: {c['angle_deg']:.1f}deg ({c['orientation_type']})"
-        tx = int(np.clip(cx + 10, 10, original_bgr.shape[1] - 220))
-        ty = int(np.clip(cy - 10, 25, original_bgr.shape[0] - 10))
-        
-        (tw, th), _ = cv2.getTextSize(badge, cv2.FONT_HERSHEY_SIMPLEX, 0.45, 1)
-        cv2.rectangle(vis, (tx - 3, ty - th - 3), (tx + tw + 3, ty + 3), (20, 20, 20), -1)
-        cv2.rectangle(vis, (tx - 3, ty - th - 3), (tx + tw + 3, ty + 3), color, 1)
-        cv2.putText(vis, badge, (tx, ty), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1, cv2.LINE_AA)
-        
-    # Top HUD banner
+
     dom_angle = orientations_data.get('dominant_angle_deg', 0.0)
-    dom_type = orientations_data.get('dominant_type', 'Undetermined')
-    hud_text = f"Dominant Orientation: {dom_angle:.1f}deg ({dom_type})  |  PCA Comps: {len(components)}"
+    dom_type  = orientations_data.get('dominant_type', 'Undetermined')
+    n_comps   = orientations_data.get('evaluated_component_count', 0)
+
+    # Retrieve pre-computed dominant eigenvector and centroid from measure_crack_orientations
+    dom_center     = orientations_data.get('dominant_center', None)
+    dom_eigenvec   = orientations_data.get('dominant_eigenvector', None)
+
+    # --- Dominant PCA axis across the whole image ---
+    if dom_center is not None and dom_eigenvec is not None:
+        cx, cy = float(dom_center[0]), float(dom_center[1])
+        vx, vy = float(dom_eigenvec[0]), float(dom_eigenvec[1])
+
+        # Extend axis until it hits the image boundary
+        # parametric line: (cx + t*vx, cy + t*vy) — solve for t at all 4 edges
+        t_candidates = []
+        eps = 1e-9
+        if abs(vx) > eps:
+            t_candidates.append((0 - cx) / vx)        # left edge
+            t_candidates.append((img_w - 1 - cx) / vx)  # right edge
+        if abs(vy) > eps:
+            t_candidates.append((0 - cy) / vy)        # top edge
+            t_candidates.append((img_h - 1 - cy) / vy)  # bottom edge
+
+        if t_candidates:
+            t_min = min(t_candidates)
+            t_max = max(t_candidates)
+            ax_p1 = (int(round(cx + t_min * vx)), int(round(cy + t_min * vy)))
+            ax_p2 = (int(round(cx + t_max * vx)), int(round(cy + t_max * vy)))
+        else:
+            # Fallback: short fixed-length axis
+            half = min(img_w, img_h) // 3
+            ax_p1 = (int(round(cx - vx * half)), int(round(cy - vy * half)))
+            ax_p2 = (int(round(cx + vx * half)), int(round(cy + vy * half)))
+
+        # Dark shadow for contrast, then bright color on top
+        AXIS_COLOR = (0, 220, 255)   # Amber/Gold
+        cv2.line(vis, ax_p1, ax_p2, (10, 10, 10), 5, cv2.LINE_AA)   # shadow
+        cv2.line(vis, ax_p1, ax_p2, AXIS_COLOR,   3, cv2.LINE_AA)   # axis
+
+        # Arrowhead at both ends to indicate bi-directional principal axis
+        cv2.arrowedLine(vis, ax_p2, ax_p1, AXIS_COLOR, 2, cv2.LINE_AA, tipLength=0.02)
+        cv2.arrowedLine(vis, ax_p1, ax_p2, AXIS_COLOR, 2, cv2.LINE_AA, tipLength=0.02)
+
+        # Centroid marker
+        cx_i, cy_i = int(round(cx)), int(round(cy))
+        cv2.circle(vis, (cx_i, cy_i), 9,  (10, 10, 10),  -1)
+        cv2.circle(vis, (cx_i, cy_i), 7,  AXIS_COLOR,     -1)
+        cv2.circle(vis, (cx_i, cy_i), 3,  (255, 255, 255), -1)
+
+        # Angle badge next to centroid (single, non-overlapping)
+        badge = f"{dom_angle:.1f}deg"
+        (bw, bh), _ = cv2.getTextSize(badge, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 1)
+        bx = int(np.clip(cx_i + 14, 10, img_w - bw - 14))
+        by = int(np.clip(cy_i - 14, 40, img_h - bh - 14))
+        cv2.rectangle(vis, (bx - 4, by - bh - 4), (bx + bw + 4, by + 4), (10, 10, 10), -1)
+        cv2.rectangle(vis, (bx - 4, by - bh - 4), (bx + bw + 4, by + 4), AXIS_COLOR, 1, cv2.LINE_AA)
+        cv2.putText(vis, badge, (bx, by), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1, cv2.LINE_AA)
+
+    # --- Top HUD banner ---
+    hud_text = f"Dominant Orientation: {dom_angle:.1f}deg ({dom_type})  |  PCA Comps: {n_comps}"
     (hw, hh), _ = cv2.getTextSize(hud_text, cv2.FONT_HERSHEY_SIMPLEX, 0.60, 2)
-    cv2.rectangle(vis, (10, 10), (10 + hw + 20, 10 + hh + 16), (20, 20, 20), -1)
-    cv2.rectangle(vis, (10, 10), (10 + hw + 20, 10 + hh + 16), (255, 128, 0), 2)
-    cv2.putText(vis, hud_text, (20, 10 + hh + 8), cv2.FONT_HERSHEY_SIMPLEX, 0.60, (0, 255, 255), 2, cv2.LINE_AA)
-    
+    cv2.rectangle(vis, (10, 8), (10 + hw + 20, 8 + hh + 16), (10, 10, 10), -1)
+    cv2.rectangle(vis, (10, 8), (10 + hw + 20, 8 + hh + 16), (255, 128, 0), 2)
+    cv2.putText(vis, hud_text, (20, 8 + hh + 8), cv2.FONT_HERSHEY_SIMPLEX, 0.60, (0, 255, 255), 2, cv2.LINE_AA)
+
     return vis
 
 
