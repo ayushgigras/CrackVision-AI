@@ -6,6 +6,9 @@ directly or calculated from a known reference length measured in the image.
 
 from copy import deepcopy
 
+import cv2
+import numpy as np
+
 
 def calculate_mm_per_pixel(reference_length_mm: float,
                            reference_length_px: float) -> float:
@@ -49,6 +52,83 @@ def calibrate_measurements(measurements: dict,
         for component in calibrated.get('components', [])
     ]
     return calibrated
+
+
+def _get_aruco_dictionary(dictionary_name: str):
+    """Resolve an OpenCV predefined ArUco dictionary by name."""
+    if not hasattr(cv2, 'aruco'):
+        raise RuntimeError("OpenCV ArUco support is unavailable; install opencv-contrib-python")
+    dictionary_id = getattr(cv2.aruco, dictionary_name, None)
+    if dictionary_id is None:
+        raise ValueError(f"Unknown ArUco dictionary: {dictionary_name}")
+    return cv2.aruco.getPredefinedDictionary(dictionary_id)
+
+
+def _marker_side_lengths(corners: np.ndarray) -> np.ndarray:
+    """Return the four detected marker side lengths in pixels."""
+    return np.linalg.norm(np.roll(corners, -1, axis=0) - corners, axis=1)
+
+
+def rectify_aruco_marker(image: np.ndarray,
+                         corners: np.ndarray,
+                         output_size: int = 600) -> np.ndarray:
+    """Perspective-correct a detected marker into a square image."""
+    destination = np.array([
+        [0, 0],
+        [output_size - 1, 0],
+        [output_size - 1, output_size - 1],
+        [0, output_size - 1],
+    ], dtype=np.float32)
+    homography = cv2.getPerspectiveTransform(corners.astype(np.float32), destination)
+    return cv2.warpPerspective(image, homography, (output_size, output_size))
+
+
+def detect_aruco_calibration(image: np.ndarray,
+                             marker_size_mm: float,
+                             dictionary_name: str = 'DICT_4X4_50') -> dict:
+    """Detect one ArUco marker and calculate its physical image scale.
+
+    The marker's physical side length must be supplied by the caller. No scale
+    is returned when detection fails.
+    """
+    if marker_size_mm <= 0:
+        raise ValueError("marker_size_mm must be greater than zero")
+
+    dictionary = _get_aruco_dictionary(dictionary_name)
+    parameters = cv2.aruco.DetectorParameters()
+    if hasattr(cv2.aruco, 'ArucoDetector'):
+        detector = cv2.aruco.ArucoDetector(dictionary, parameters)
+        corners, ids, _ = detector.detectMarkers(image)
+    else:
+        corners, ids, _ = cv2.aruco.detectMarkers(image, dictionary, parameters=parameters)
+
+    if ids is None or not corners:
+        return {
+            'is_calibrated': False,
+            'status': 'marker_not_detected',
+            'mm_per_pixel': None,
+            'marker_id': None,
+            'marker_corners': None,
+            'rectified_marker': None,
+        }
+
+    marker_corners = np.asarray(corners[0], dtype=np.float32).reshape(4, 2)
+    side_lengths_px = _marker_side_lengths(marker_corners)
+    marker_width_px = float(np.mean(side_lengths_px))
+    mm_per_pixel = calculate_mm_per_pixel(marker_size_mm, marker_width_px)
+
+    return {
+        'is_calibrated': True,
+        'status': 'calibrated',
+        'mm_per_pixel': mm_per_pixel,
+        'marker_id': int(ids[0][0]),
+        'marker_corners': marker_corners,
+        'side_lengths_px': side_lengths_px,
+        'marker_width_px': marker_width_px,
+        'marker_size_mm': float(marker_size_mm),
+        'dictionary': dictionary_name,
+        'rectified_marker': rectify_aruco_marker(image, marker_corners),
+    }
 
 
 def get_calibration_scale(mm_per_pixel: float = None,

@@ -31,7 +31,11 @@ from src.measurement import (
     visualize_length_measurement,
     visualize_orientation_measurement,
 )
-from src.calibration import calibrate_measurements, get_calibration_scale
+from src.calibration import (
+    calibrate_measurements,
+    detect_aruco_calibration,
+    get_calibration_scale,
+)
 
 
 def process_single_image(image_path: str, output_dir: str, args):
@@ -89,15 +93,49 @@ def process_single_image(image_path: str, output_dir: str, args):
     viz_orient_path = os.path.join(output_dir, f"{base_name}_orientation_viz.png")
     visualize_orientation_measurement(meas_results, save_path=viz_orient_path)
 
-    # --- Step 5: Physical Calibration (pixels -> millimetres) ---
-    calibration_scale = get_calibration_scale(
-        mm_per_pixel=getattr(args, 'mm_per_pixel', None),
-        reference_length_mm=getattr(args, 'reference_length_mm', None),
-        reference_length_px=getattr(args, 'reference_length_px', None),
-    )
+    # --- Step 5: ArUco Calibration (detection -> rectification -> scale) ---
+    aruco_calibration = {
+        'is_calibrated': False,
+        'status': 'marker_not_configured',
+        'mm_per_pixel': None,
+    }
+    marker_size_mm = getattr(args, 'marker_size_mm', None)
+    if marker_size_mm is not None:
+        aruco_calibration = detect_aruco_calibration(
+            prep_results['original'],
+            marker_size_mm=marker_size_mm,
+            dictionary_name=getattr(args, 'aruco_dictionary', 'DICT_4X4_50'),
+        )
+        if aruco_calibration['is_calibrated']:
+            rectified_path = os.path.join(output_dir, f"{base_name}_aruco_rectified.png")
+            import cv2
+            cv2.imwrite(rectified_path, aruco_calibration['rectified_marker'])
+            print(
+                f"[OK] ArUco marker {aruco_calibration['marker_id']} detected: "
+                f"{aruco_calibration['marker_width_px']:.2f} px = {marker_size_mm:.2f} mm"
+            )
+        else:
+            print("[WARNING] Calibration marker not detected.")
+            print("Width/Length reported in pixels only.")
+
+    calibration_scale = aruco_calibration.get('mm_per_pixel')
+    if calibration_scale is None and marker_size_mm is None:
+        # Manual calibration is only used when automatic marker calibration
+        # was not requested.
+        calibration_scale = get_calibration_scale(
+            mm_per_pixel=getattr(args, 'mm_per_pixel', None),
+            reference_length_mm=getattr(args, 'reference_length_mm', None),
+            reference_length_px=getattr(args, 'reference_length_px', None),
+        )
     if calibration_scale is not None:
         meas_results = calibrate_measurements(meas_results, calibration_scale)
+        if marker_size_mm is not None:
+            meas_results['calibration'].update(aruco_calibration)
+        else:
+            meas_results['calibration']['status'] = 'manual_scale'
         print(f"[OK] Step 5 calibration applied: {calibration_scale:.6f} mm/px")
+    else:
+        meas_results['calibration'] = aruco_calibration
     
     return {
         'image_name':  base_name,
@@ -197,6 +235,18 @@ Examples:
         default=None,
         help='Measured pixel length of the same reference'
     )
+    parser.add_argument(
+        '--marker-size-mm',
+        type=float,
+        default=None,
+        help='Physical side length of the ArUco calibration marker in millimetres'
+    )
+    parser.add_argument(
+        '--aruco-dictionary',
+        choices=['DICT_4X4_50', 'DICT_5X5_50', 'DICT_6X6_50', 'DICT_7X7_50'],
+        default='DICT_4X4_50',
+        help='Predefined ArUco dictionary used for calibration'
+    )
     
     args = parser.parse_args()
     try:
@@ -249,7 +299,7 @@ Examples:
         
     # --- Print Final Summary Report ---
     print("\n" + "="*125)
-    print("  CrackGauge Pipeline Execution Summary (Steps 1, 2, 3, 4A, 4B)")
+    print("  CrackGauge Pipeline Execution Summary (Steps 1, 2, 3, 4A, 4B, 5)")
     print("="*125)
     print(f"{'Image Name':<20} | {'Crack %':<8} | {'Comps (Raw)':<13} | {'Total Length':<13} | {'Max Width':<10} | {'Dominant Angle':<15} | {'Classification':<18}")
     print("-" * 125)
@@ -267,12 +317,14 @@ Examples:
         if 'total_length_mm' in rep['meas']:
             print(f"{'':<20} | {'':<8} | {'':<13} | {rep['meas']['total_length_mm']:>10.2f} mm | {rep['meas']['max_width_mm']:>8.2f} mm | {'':>12} | calibrated")
     print("="*125)
-    calibration_active = all_reports[0]['meas'].get('calibration', {}).get('is_calibrated', False)
+    calibration_info = all_reports[0]['meas'].get('calibration', {})
+    calibration_active = calibration_info.get('is_calibrated', False)
     if calibration_active:
-        scale = all_reports[0]['meas']['calibration']['mm_per_pixel']
-        print(f"  * Calibration: {scale:.6f} mm/px | Width/Length also available in millimetres.")
+        scale = calibration_info['mm_per_pixel']
+        marker_id = calibration_info.get('marker_id')
+        print(f"  * Calibration: ArUco marker {marker_id} | {scale:.6f} mm/px | Width/Length available in millimetres.")
     else:
-        print("  * Note: Width/Length in PIXELS, Orientation in DEGREES relative to horizontal. Use --mm-per-pixel or reference lengths for Step 5 calibration.")
+        print("  * Calibration: unavailable | Width/Length reported in pixels only.")
     
     # Detailed Component Breakdown (Length + PCA Orientation)
     print("\n" + "-"*85)
@@ -308,7 +360,7 @@ Examples:
         plt.show()
         
     print(f"\n[SUCCESS] Pipeline complete! Output directory: {args.output}/")
-    print("Steps verified: Step 1 (Preprocessing) -> Step 2 (Segmentation) -> Step 3 (Width) -> Step 4A (Length) -> Step 4B (Orientation) -> Step 5 (Calibration).")
+    print("Steps verified: Step 1 (Preprocessing) -> Step 2 (Segmentation) -> Step 3 (Width) -> Step 4A (Length) -> Step 4B (Orientation) -> Step 5 (ArUco Calibration).")
 
 
 

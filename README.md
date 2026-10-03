@@ -84,7 +84,17 @@ python main.py --image data/sample_images/crack1.jpg --mm-per-pixel 0.05
 
 # Reference-based calibration (known reference length / measured pixels)
 python main.py --image data/sample_images/crack1.jpg --reference-length-mm 100 --reference-length-px 820
+
+# Automatic ArUco calibration (marker must be visible in the image)
+python main.py --image data/sample_images/crack1.jpg --marker-size-mm 50
 ```
+
+For automatic calibration, place a printed ArUco marker in the same plane as
+the concrete surface and pass its measured physical side length with
+`--marker-size-mm`. The default dictionary is `DICT_4X4_50`; select another
+supported dictionary with `--aruco-dictionary`. If the marker is not detected,
+the pipeline does not calculate a scale and reports width and length in pixels
+only.
 
 ---
 
