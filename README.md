@@ -40,7 +40,7 @@ CrackGauge/
 │   ├── preprocessing.py    # Step 1: Image preprocessing pipeline
 │   ├── segmentation.py     # Step 2: Crack segmentation
 │   ├── measurement.py      # Step 3: Width/Length/Orientation
-│   ├── calibration.py      # Step 4: Pixel → mm conversion
+│   ├── calibration.py      # Step 5: Pixel -> mm conversion
 │   └── report.py           # Step 6: PDF report generation
 ├── data/
 │   ├── sample_images/      # Input crack images
@@ -78,6 +78,12 @@ pip install -r requirements.txt
 ### 4. Run pipeline
 ```bash
 python main.py --image data/sample_images/crack1.jpg
+
+# Direct calibration scale
+python main.py --image data/sample_images/crack1.jpg --mm-per-pixel 0.05
+
+# Reference-based calibration (known reference length / measured pixels)
+python main.py --image data/sample_images/crack1.jpg --reference-length-mm 100 --reference-length-px 820
 ```
 
 ---

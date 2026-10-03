@@ -31,6 +31,7 @@ from src.measurement import (
     visualize_length_measurement,
     visualize_orientation_measurement,
 )
+from src.calibration import calibrate_measurements, get_calibration_scale
 
 
 def process_single_image(image_path: str, output_dir: str, args):
@@ -87,6 +88,16 @@ def process_single_image(image_path: str, output_dir: str, args):
     # Save Step 4B Orientation Visualization (PCA)
     viz_orient_path = os.path.join(output_dir, f"{base_name}_orientation_viz.png")
     visualize_orientation_measurement(meas_results, save_path=viz_orient_path)
+
+    # --- Step 5: Physical Calibration (pixels -> millimetres) ---
+    calibration_scale = get_calibration_scale(
+        mm_per_pixel=getattr(args, 'mm_per_pixel', None),
+        reference_length_mm=getattr(args, 'reference_length_mm', None),
+        reference_length_px=getattr(args, 'reference_length_px', None),
+    )
+    if calibration_scale is not None:
+        meas_results = calibrate_measurements(meas_results, calibration_scale)
+        print(f"[OK] Step 5 calibration applied: {calibration_scale:.6f} mm/px")
     
     return {
         'image_name':  base_name,
@@ -168,8 +179,34 @@ Examples:
         action='store_true',
         help='Display visualization window (requires display)'
     )
+    parser.add_argument(
+        '--mm-per-pixel',
+        type=float,
+        default=None,
+        help='Direct physical calibration scale in millimetres per pixel'
+    )
+    parser.add_argument(
+        '--reference-length-mm',
+        type=float,
+        default=None,
+        help='Known physical length of a reference in the image, in millimetres'
+    )
+    parser.add_argument(
+        '--reference-length-px',
+        type=float,
+        default=None,
+        help='Measured pixel length of the same reference'
+    )
     
     args = parser.parse_args()
+    try:
+        get_calibration_scale(
+            mm_per_pixel=args.mm_per_pixel,
+            reference_length_mm=args.reference_length_mm,
+            reference_length_px=args.reference_length_px,
+        )
+    except ValueError as error:
+        parser.error(str(error))
     
     import glob
     
@@ -227,12 +264,19 @@ Examples:
         dom_ang = rep['meas']['dominant_angle_deg']
         dom_type = rep['meas']['dominant_type']
         print(f"{name:<20} | {cp_pct:>7.2f}% | {comps_str:>13} | {tot_len:>10.1f} px | {max_w:>8.2f} px | {dom_ang:>12.1f} deg | {dom_type:<18}")
+        if 'total_length_mm' in rep['meas']:
+            print(f"{'':<20} | {'':<8} | {'':<13} | {rep['meas']['total_length_mm']:>10.2f} mm | {rep['meas']['max_width_mm']:>8.2f} mm | {'':>12} | calibrated")
     print("="*125)
-    print("  * Note: Width/Length in PIXELS, Orientation in DEGREES relative to horizontal [0, 180). Calibration pending Step 5.")
+    calibration_active = all_reports[0]['meas'].get('calibration', {}).get('is_calibrated', False)
+    if calibration_active:
+        scale = all_reports[0]['meas']['calibration']['mm_per_pixel']
+        print(f"  * Calibration: {scale:.6f} mm/px | Width/Length also available in millimetres.")
+    else:
+        print("  * Note: Width/Length in PIXELS, Orientation in DEGREES relative to horizontal. Use --mm-per-pixel or reference lengths for Step 5 calibration.")
     
     # Detailed Component Breakdown (Length + PCA Orientation)
     print("\n" + "-"*85)
-    print("  Per-Component Crack Measurement Breakdown (PIXELS & DEGREES):")
+    print("  Per-Component Crack Measurement Breakdown (PIXELS, MILLIMETRES & DEGREES):")
     print("-" * 85)
     for rep in all_reports:
         name = rep['image_name']
@@ -244,6 +288,7 @@ Examples:
         for c in comps:
             cid = c['id']
             clen = c['length_px']
+            clen_mm = c.get('length_mm')
             pts = c['skeleton_pixels']
             area = c['mask_area']
             if cid in orients:
@@ -252,7 +297,10 @@ Examples:
             else:
                 o_ang = "N/A"
                 o_type = "(Too small for PCA)"
-            print(f"    - Comp #{cid:2d}: Length = {clen:>7.1f} px | PCA Angle = {o_ang:>9} {o_type:<20} | Skel = {pts:>4d} px | Area = {area:>4d} px")
+            length_text = f"{clen:>7.1f} px"
+            if clen_mm is not None:
+                length_text += f" / {clen_mm:>7.2f} mm"
+            print(f"    - Comp #{cid:2d}: Length = {length_text} | PCA Angle = {o_ang:>9} {o_type:<20} | Skel = {pts:>4d} px | Area = {area:>4d} px")
     print("-" * 85)
     
     if args.show:
@@ -260,7 +308,7 @@ Examples:
         plt.show()
         
     print(f"\n[SUCCESS] Pipeline complete! Output directory: {args.output}/")
-    print("Steps verified: Step 1 (Preprocessing) -> Step 2 (Segmentation) -> Step 3 (Width) -> Step 4A (Length) -> Step 4B (Orientation).")
+    print("Steps verified: Step 1 (Preprocessing) -> Step 2 (Segmentation) -> Step 3 (Width) -> Step 4A (Length) -> Step 4B (Orientation) -> Step 5 (Calibration).")
 
 
 
