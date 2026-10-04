@@ -1,12 +1,15 @@
 """
 CrackGauge - Main Entry Point
 ==============================
-Run the full preprocessing pipeline from command line.
+Run the full crack-measurement pipeline on any input image.
 
 Usage:
-    python main.py                              # auto-finds image in data/sample_images/
-    python main.py --image path/to/crack.jpg   # specific image
-    python main.py --image path/to/crack.jpg --show   # also show plots
+    python main.py                                                # interactive: prompts for image path
+    python main.py --image path/to/crack.jpg                     # direct CLI argument
+    python main.py --image path/to/crack.jpg --show              # also display plots
+    python main.py --all                                          # process all images in data/sample_images/
+
+Supported formats: .jpg  .jpeg  .png  .bmp  .webp
 """
 
 import argparse
@@ -172,41 +175,91 @@ Examples:
     args = parser.parse_args()
     
     import glob
-    
+    import cv2
+
+    SUPPORTED_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
+
+    def validate_image_path(path: str) -> str:
+        """Normalise, validate existence, extension, and OpenCV readability.
+        Returns the normalised path or calls sys.exit on error."""
+        # Normalise: strip surrounding quotes that shells / users sometimes leave in
+        path = path.strip().strip('"').strip("'")
+        # Convert to OS-native separators so Windows paths work correctly
+        path = os.path.normpath(path)
+
+        if not os.path.isfile(path):
+            print(f"\n[ERROR] File not found: {path}")
+            print("        Please check the path and try again.")
+            sys.exit(1)
+
+        ext = os.path.splitext(path)[1].lower()
+        if ext not in SUPPORTED_EXTS:
+            print(f"\n[ERROR] Unsupported file format: '{ext}'")
+            print(f"        Supported formats: {', '.join(sorted(SUPPORTED_EXTS))}")
+            sys.exit(1)
+
+        img_check = cv2.imread(path)
+        if img_check is None:
+            print(f"\n[ERROR] OpenCV could not read the image: {path}")
+            print("        The file may be corrupted or in an unsupported colour space.")
+            sys.exit(1)
+
+        return path
+
+    # ------------------------------------------------------------------
     # Collect target images
+    # ------------------------------------------------------------------
     target_images = []
-    
+
     if args.all:
-        for ext in ("*.jpg", "*.jpeg", "*.png", "*.bmp"):
+        for ext in ("*.jpg", "*.jpeg", "*.png", "*.bmp", "*.webp"):
             target_images.extend(glob.glob(os.path.join("data/sample_images", ext)))
         target_images = sorted(list(set(target_images)))
         if not target_images:
             print("[ERROR] No images found in data/sample_images/")
             sys.exit(1)
-        print(f"[INFO] Found {len(target_images)} images to process.")
+        print(f"[INFO] Found {len(target_images)} image(s) to process.")
+
     elif args.image:
-        if not os.path.exists(args.image):
-            print(f"[ERROR] Image not found: {args.image}")
-            sys.exit(1)
-        target_images = [args.image]
+        # --- OPTION 1: path provided via --image / -i argument ---
+        validated = validate_image_path(args.image)
+        target_images = [validated]
+
     else:
-        # Auto-search first available image
-        for ext in ("*.jpg", "*.jpeg", "*.png", "*.bmp"):
-            found = glob.glob(os.path.join("data/sample_images", ext))
-            if found:
-                target_images = [sorted(found)[0]]
-                print(f"[Auto] Using image: {target_images[0]}")
-                break
-                
+        # --- OPTION 2: no argument — interactive prompt ---
+        print()
+        print("CrackGauge - Interactive Image Input")
+        print("-" * 40)
+        print(f"Supported formats: {', '.join(sorted(SUPPORTED_EXTS))}")
+        print()
+        raw_path = input("Enter input image path: ").strip()
+        if not raw_path:
+            print("\n[ERROR] No path entered. Exiting.")
+            sys.exit(1)
+        validated = validate_image_path(raw_path)
+        target_images = [validated]
+
     if not target_images:
         print("[ERROR] No image found!")
         print("   Place a crack image in: data/sample_images/")
         print("   Or run: python main.py --image your_image.jpg")
         sys.exit(1)
-        
-    # --- Execute Pipeline on all target images ---
+
+    # ------------------------------------------------------------------
+    # Execute Pipeline on all target images
+    # ------------------------------------------------------------------
     all_reports = []
     for img_path in target_images:
+        print()
+        print("=" * 60)
+        print(f"[INPUT] Image: {img_path}")
+        print("=" * 60)
+        print("Step 1 --> Preprocessing")
+        print("Step 2 --> Segmentation (Frangi / Hessian)")
+        print("Step 3 --> Width Measurement")
+        print("Step 4A --> Length Measurement")
+        print("Step 4B --> Orientation (PCA)")
+        print("=" * 60)
         res = process_single_image(img_path, args.output, args)
         all_reports.append(res)
         
