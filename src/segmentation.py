@@ -151,6 +151,71 @@ def fuse_masks(ridge_mask: np.ndarray,
         raise ValueError(f"Unknown fusion mode: {mode}")
 
 
+SEGMENTATION_PROFILES = ("baseline", "adaptive_recovery", "guided_recovery")
+
+
+def select_segmentation_profile(
+    ridge_mask: np.ndarray,
+    adaptive_mask: np.ndarray | None,
+    profile: str = "baseline",
+    fusion_mode: str = "frangi_primary",
+    guided_kernel_size: int = 5,
+) -> np.ndarray:
+    """Select a final mask while preserving the existing baseline path.
+
+    ``baseline`` delegates to the existing fusion behavior. ``adaptive_recovery``
+    uses the cleaned adaptive mask. ``guided_recovery`` keeps the ridge mask and
+    adds only adaptive components that overlap a small dilation of a ridge seed.
+    """
+    if profile not in SEGMENTATION_PROFILES:
+        raise ValueError(
+            f"Unknown segmentation profile: {profile}. "
+            f"Expected one of: {', '.join(SEGMENTATION_PROFILES)}"
+        )
+    _validate_profile_mask(ridge_mask, "ridge_mask")
+    if adaptive_mask is not None:
+        _validate_profile_mask(adaptive_mask, "adaptive_mask")
+        if adaptive_mask.shape != ridge_mask.shape:
+            raise ValueError(
+                "ridge_mask and adaptive_mask must have matching dimensions"
+            )
+    if profile != "baseline" and adaptive_mask is None:
+        raise ValueError(
+            f"Segmentation profile '{profile}' requires an adaptive mask"
+        )
+
+    if profile == "baseline":
+        return fuse_masks(ridge_mask, adaptive_mask, mode=fusion_mode) if adaptive_mask is not None else ridge_mask
+    if profile == "adaptive_recovery":
+        return np.where(adaptive_mask > 0, 255, 0).astype(np.uint8)
+
+    if guided_kernel_size < 1 or guided_kernel_size % 2 == 0:
+        raise ValueError("guided_kernel_size must be a positive odd integer")
+    ridge_binary = ridge_mask > 0
+    adaptive_binary = adaptive_mask > 0
+    kernel = cv2.getStructuringElement(
+        cv2.MORPH_ELLIPSE, (guided_kernel_size, guided_kernel_size)
+    )
+    ridge_seed = cv2.dilate(ridge_binary.astype(np.uint8), kernel) > 0
+    num_labels, labels, _, _ = cv2.connectedComponentsWithStats(
+        adaptive_binary.astype(np.uint8), connectivity=8
+    )
+    recovered_adaptive = np.zeros_like(ridge_mask, dtype=np.uint8)
+    for label in range(1, num_labels):
+        component = labels == label
+        if np.any(component & ridge_seed):
+            recovered_adaptive[component] = 255
+    return np.where(ridge_binary | (recovered_adaptive > 0), 255, 0).astype(np.uint8)
+
+
+def _validate_profile_mask(mask: np.ndarray, name: str) -> None:
+    """Validate a binary mask supplied to a segmentation profile."""
+    if not isinstance(mask, np.ndarray) or mask.ndim != 2:
+        raise ValueError(f"{name} must be a 2D numpy array")
+    if mask.dtype not in (np.dtype(np.uint8), np.dtype(bool)):
+        raise TypeError(f"{name} must use bool or uint8 dtype")
+
+
 def create_crack_overlay(original_bgr: np.ndarray,
                          crack_mask: np.ndarray,
                          color: tuple = (0, 0, 255),
@@ -193,6 +258,7 @@ def run_segmentation_pipeline(preprocessed_results: dict,
                               binarize_method: str = "otsu",
                               min_area: int = 80,
                               fusion_mode: str = "frangi_primary",
+                              segmentation_profile: str = "baseline",
                               save_steps: bool = True) -> dict:
     """
     Execute the full Step 2 Segmentation Pipeline on preprocessed results.
@@ -204,6 +270,7 @@ def run_segmentation_pipeline(preprocessed_results: dict,
         binarize_method:      'otsu' or 'cutoff'
         min_area:             Minimum component size in pixels
         fusion_mode:          'frangi_primary', 'intersection', or 'union'
+        segmentation_profile: 'baseline', 'adaptive_recovery', or 'guided_recovery'
         save_steps:           Whether to write step images to disk
         
     Returns:
@@ -229,10 +296,12 @@ def run_segmentation_pipeline(preprocessed_results: dict,
     cleaned_ridge, kept_count = filter_crack_components(ridge_binary, min_area=min_area)
     
     # 4. Fusion (if adaptive_mask exists)
-    if adaptive_mask is not None:
-        final_mask = fuse_masks(cleaned_ridge, adaptive_mask, mode=fusion_mode)
-    else:
-        final_mask = cleaned_ridge
+    final_mask = select_segmentation_profile(
+        cleaned_ridge,
+        adaptive_mask,
+        profile=segmentation_profile,
+        fusion_mode=fusion_mode,
+    )
         
     # 5. Overlay
     overlay = create_crack_overlay(original, final_mask, color=(0, 0, 255), alpha=0.65)
