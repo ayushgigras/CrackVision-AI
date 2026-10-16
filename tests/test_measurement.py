@@ -16,8 +16,8 @@ class TestCrackWidth(unittest.TestCase):
         self.assertEqual(result["median_width_px"], 0.0)
         self.assertEqual(result["skeleton_points"], 0)
 
-    def test_width_for_multiple_thicknesses(self):
-        thicknesses = [3, 5, 7, 9]
+    def test_horizontal_cracks_different_widths(self):
+        thicknesses = [2, 3, 4, 5, 6, 7, 8, 9, 10]
 
         print("\n--- Horizontal Crack Width Evaluation ---")
 
@@ -25,7 +25,7 @@ class TestCrackWidth(unittest.TestCase):
             with self.subTest(thickness=thickness):
                 mask = np.zeros((100, 100), dtype=np.uint8)
 
-                start_row = 50 - thickness // 2
+                start_row = (100 - thickness) // 2
                 mask[start_row:start_row + thickness, 10:90] = 255
 
                 result = measure_crack_widths(mask)
@@ -34,17 +34,17 @@ class TestCrackWidth(unittest.TestCase):
                 error = abs(thickness - measured)
 
                 print(
-                    f"Expected: {thickness}px | "
-                    f"Measured: {measured:.2f}px | "
-                    f"Absolute Error: {error:.2f}px"
+                    f"Expected: {thickness:2d} px | "
+                    f"Measured: {measured:.2f} px | "
+                    f"Error: {error:.2f} px"
                 )
 
+                # Sanity check: the detected crack should have positive width.
                 self.assertGreater(measured, 0)
 
     def test_vertical_crack_width(self):
         mask = np.zeros((100, 100), dtype=np.uint8)
 
-        # Create a vertical crack 5 pixels wide
         mask[10:90, 48:53] = 255
 
         result = measure_crack_widths(mask)
@@ -53,10 +53,11 @@ class TestCrackWidth(unittest.TestCase):
         error = abs(5 - measured)
 
         print("\n--- Vertical Crack Width Evaluation ---")
-        print(f"Expected: 5px | Measured: {measured:.2f}px")
-        print(f"Absolute Error: {error:.2f}px")
+        print(f"Expected: 5 px | Measured: {measured:.2f} px")
+        print(f"Absolute Error: {error:.2f} px")
 
         self.assertGreater(measured, 0)
+        self.assertLessEqual(error, 1.0)
 
 
 if __name__ == "__main__":
