@@ -238,18 +238,28 @@ python tools\evaluate_validation_dataset.py
 ```
 
 The default command discovers images in `data\real_images`, matching masks in
-`data\ground_truth`, evaluates `baseline`, `adaptive_recovery`, and
-`guided_recovery`, and writes:
+`data\ground_truth`, validates mask dimensions and binary values, evaluates
+`baseline`, `adaptive_recovery`, `guided_recovery`, and `hysteresis_recovery`, and writes:
 
 ```text
 data/outputs/multi_image_validation.csv
 ```
 
+To compare baseline against the three isolated hysteresis filtering strategies
+(Strategy A: min_area=200, Strategy B: min_area=80, Strategy C: shape filter):
+
+```powershell
+python tools\evaluate_validation_dataset.py `
+  --mode hysteresis_strategies `
+  --output-csv data\outputs\multi_image_validation_strategies.csv
+```
+
 The CSV contains one row per evaluated image/profile and explicit `skipped`
 rows for images with missing or unreadable masks, unreadable images, dimension
-mismatches, or evaluation failures. Skipped candidates are never treated as
-negative examples. The command prints aggregate TP, FP, FN, precision, recall,
-Dice/F1, and IoU for each profile across valid evaluated pairs.
+mismatches, non-binary values, empty masks, or evaluation failures. Skipped candidates
+are never treated as negative examples. The command prints aggregate TP, FP, FN, TN,
+precision, recall, Dice/F1, and IoU computed from **summed integer confusion matrices**
+(micro-averaging) across all valid evaluated pairs.
 
 Use custom directories or an output path when needed:
 
@@ -264,7 +274,7 @@ The reported sample count is the number of valid image-mask pairs, not the
 number of images discovered. With only one annotated image, the aggregate
 results are one-image results and must not be described as dataset-wide
 accuracy. Add more independently annotated masks before making dataset-level
-claims.
+claims. See [docs/ANNOTATION_GUIDELINE.md](docs/ANNOTATION_GUIDELINE.md) for details.
 
 ### Manual ground-truth mask annotation
 
@@ -278,6 +288,24 @@ For the first real image, run this from the repository root:
 python tools\annotate_mask.py `
   --image data\real_images\00001.jpg `
   --output data\ground_truth\00001_mask.png
+```
+
+To safely load and resume editing an existing mask:
+
+```powershell
+python tools\annotate_mask.py `
+  --image data\real_images\00001.jpg `
+  --output data\ground_truth\00001_mask.png `
+  --resume
+```
+
+To validate an existing mask against the contract without opening the GUI:
+
+```powershell
+python tools\annotate_mask.py `
+  --image data\real_images\00001.jpg `
+  --output data\ground_truth\00001_mask.png `
+  --validate-only
 ```
 
 The tool opens the original image in a window. The output mask keeps the

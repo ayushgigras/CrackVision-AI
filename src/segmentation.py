@@ -94,6 +94,62 @@ def binarize_ridge(ridge_norm: np.ndarray,
         
     return binary
 
+def binarize_ridge_hysteresis(
+    ridge_norm: np.ndarray,
+    low_thresh: int = 25,
+    high_thresh: int = 48,
+) -> np.ndarray:
+    """Dual-threshold hysteresis binarization of the normalized Frangi response.
+
+    Pixels with ridge_norm >= high_thresh are marked as *strong* seeds.
+    Pixels with low_thresh <= ridge_norm < high_thresh are *weak* candidates.
+    Weak pixels are accepted only when they are 8-connected to at least one
+    strong pixel (directly or through other accepted weak pixels).
+    All other pixels are background.
+
+    This avoids the Otsu single-threshold problem where an aggressive cutoff
+    discards faint-but-connected crack ridge pixels while a permissive cutoff
+    admits broad concrete texture.
+
+    Args:
+        ridge_norm:  Normalized 8-bit Frangi response (uint8, 0–255).
+        low_thresh:  Lower hysteresis threshold (inclusive).
+        high_thresh: Upper hysteresis threshold (inclusive).
+
+    Returns:
+        Binary mask (uint8) with accepted crack pixels as 255.
+
+    Raises:
+        ValueError: If thresholds are out of range or low >= high.
+    """
+    if not (0 <= low_thresh < high_thresh <= 255):
+        raise ValueError(
+            f"Require 0 <= low_thresh < high_thresh <= 255; "
+            f"got low_thresh={low_thresh}, high_thresh={high_thresh}"
+        )
+
+    strong = ridge_norm >= high_thresh
+    weak = (ridge_norm >= low_thresh) & ~strong
+
+    # Label connected components across the union of strong + weak pixels.
+    candidate = (strong | weak).astype(np.uint8)
+    num_labels, labels = cv2.connectedComponents(candidate, connectivity=8)
+
+    # Accept only those components that contain at least one strong pixel.
+    strong_labels = set(np.unique(labels[strong])) - {0}
+    result = np.zeros_like(ridge_norm, dtype=np.uint8)
+    for lbl in strong_labels:
+        result[labels == lbl] = 255
+
+    accepted = int(np.sum(result > 0))
+    total_strong = int(np.sum(strong))
+    total_weak = int(np.sum(weak))
+    print(
+        f"[OK] Hysteresis binarization (low={low_thresh}, high={high_thresh}): "
+        f"{total_strong} strong, {total_weak} weak, {accepted} accepted"
+    )
+    return result
+
 
 def filter_crack_components(binary_mask: np.ndarray,
                             min_area: int = 80,
@@ -126,6 +182,94 @@ def filter_crack_components(binary_mask: np.ndarray,
     return cleaned, kept
 
 
+def filter_crack_components_by_shape(
+    binary_mask: np.ndarray,
+    min_area: int = 80,
+    large_area_thresh: int = 200,
+    interior_aspect_thresh: float = 2.2,
+    boundary_aspect_thresh: float = 1.6,
+    min_skeleton_length: int = 20,
+    connectivity: int = 8,
+) -> tuple[np.ndarray, int]:
+    """Filter binary components by area and elongation with boundary-aware handling.
+
+    - Components with area < min_area are discarded as micro-noise.
+    - Components with area >= large_area_thresh are unconditionally preserved
+      as primary crack structures.
+    - Intermediate components (min_area <= area < large_area_thresh) are evaluated
+      for crack-like elongation via oriented minimum-area bounding box aspect ratio
+      and medial axis skeleton length.
+    - For boundary-touching components (which are physically truncated by the image frame),
+      the aspect ratio threshold is relaxed to boundary_aspect_thresh.
+
+    Args:
+        binary_mask: Binary input mask (0 or 255)
+        min_area: Minimum area to be considered (default: 80)
+        large_area_thresh: Area at or above which components are always kept (default: 200)
+        interior_aspect_thresh: Minimum oriented aspect ratio for interior components (default: 2.2)
+        boundary_aspect_thresh: Minimum oriented aspect ratio for boundary components (default: 1.6)
+        min_skeleton_length: Minimum medial axis skeleton pixels (default: 20)
+        connectivity: Pixel connectivity (4 or 8)
+
+    Returns:
+        (cleaned_mask, kept_count): Filtered binary mask and count of kept components
+    """
+    if binary_mask is None or np.sum(binary_mask > 0) == 0:
+        empty = np.zeros((1, 1), dtype=np.uint8) if binary_mask is None else np.zeros_like(binary_mask)
+        return empty, 0
+
+    from skimage.morphology import skeletonize
+
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(
+        binary_mask, connectivity=connectivity
+    )
+    h_img, w_img = binary_mask.shape[:2]
+
+    cleaned = np.zeros_like(binary_mask, dtype=np.uint8)
+    kept = 0
+
+    for label in range(1, num_labels):
+        area = stats[label, cv2.CC_STAT_AREA]
+        if area < min_area:
+            continue
+
+        x = stats[label, cv2.CC_STAT_LEFT]
+        y = stats[label, cv2.CC_STAT_TOP]
+        w = stats[label, cv2.CC_STAT_WIDTH]
+        h = stats[label, cv2.CC_STAT_HEIGHT]
+
+        # Tier 1: Large components kept unconditionally
+        if area >= large_area_thresh:
+            cleaned[labels == label] = 255
+            kept += 1
+            continue
+
+        # Tier 2: Intermediate components (min_area <= area < large_area_thresh)
+        touches_boundary = (x == 0) or (y == 0) or (x + w >= w_img) or (y + h >= h_img)
+        comp_mask = (labels == label).astype(np.uint8) * 255
+
+        # Oriented bounding box aspect ratio (rotation-invariant)
+        contours, _ = cv2.findContours(comp_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if len(contours) > 0 and len(contours[0]) >= 3:
+            rect = cv2.minAreaRect(contours[0])
+            rw, rh = rect[1]
+            oriented_aspect = max(rw, rh) / max(1e-3, min(rw, rh))
+        else:
+            oriented_aspect = max(w, h) / max(1, min(w, h))
+
+        # Medial axis skeleton length
+        skel = skeletonize(comp_mask > 0)
+        skel_len = int(np.sum(skel))
+
+        req_aspect = boundary_aspect_thresh if touches_boundary else interior_aspect_thresh
+        if oriented_aspect >= req_aspect and skel_len >= min_skeleton_length:
+            cleaned[labels == label] = 255
+            kept += 1
+
+    print(f"[OK] Shape-aware component filtering: {num_labels - 1} found, {kept} kept")
+    return cleaned, kept
+
+
 def fuse_masks(ridge_mask: np.ndarray,
                adaptive_mask: np.ndarray,
                mode: str = "frangi_primary") -> np.ndarray:
@@ -151,7 +295,7 @@ def fuse_masks(ridge_mask: np.ndarray,
         raise ValueError(f"Unknown fusion mode: {mode}")
 
 
-SEGMENTATION_PROFILES = ("baseline", "adaptive_recovery", "guided_recovery")
+SEGMENTATION_PROFILES = ("baseline", "adaptive_recovery", "guided_recovery", "hysteresis_recovery")
 
 
 def select_segmentation_profile(
@@ -160,12 +304,25 @@ def select_segmentation_profile(
     profile: str = "baseline",
     fusion_mode: str = "frangi_primary",
     guided_kernel_size: int = 5,
+    *,
+    ridge_norm: np.ndarray | None = None,
+    hysteresis_low: int = 25,
+    hysteresis_high: int = 48,
+    hysteresis_min_area: int = 80,
+    hysteresis_use_shape_filter: bool = False,
+    hysteresis_large_area_thresh: int = 200,
+    hysteresis_interior_aspect_thresh: float = 2.2,
+    hysteresis_boundary_aspect_thresh: float = 1.6,
+    hysteresis_min_skeleton_length: int = 20,
 ) -> np.ndarray:
     """Select a final mask while preserving the existing baseline path.
 
     ``baseline`` delegates to the existing fusion behavior. ``adaptive_recovery``
     uses the cleaned adaptive mask. ``guided_recovery`` keeps the ridge mask and
     adds only adaptive components that overlap a small dilation of a ridge seed.
+    ``hysteresis_recovery`` applies dual-threshold hysteresis on the normalized
+    Frangi response (``ridge_norm``), recovering weak-ridge pixels that are
+    8-connected to strong-ridge seeds without admitting disconnected texture.
     """
     if profile not in SEGMENTATION_PROFILES:
         raise ValueError(
@@ -179,9 +336,14 @@ def select_segmentation_profile(
             raise ValueError(
                 "ridge_mask and adaptive_mask must have matching dimensions"
             )
-    if profile != "baseline" and adaptive_mask is None:
+    if profile in ("adaptive_recovery", "guided_recovery") and adaptive_mask is None:
         raise ValueError(
             f"Segmentation profile '{profile}' requires an adaptive mask"
+        )
+    if profile == "hysteresis_recovery" and ridge_norm is None:
+        raise ValueError(
+            "Segmentation profile 'hysteresis_recovery' requires ridge_norm "
+            "(the normalized uint8 Frangi response)"
         )
 
     if profile == "baseline":
@@ -189,6 +351,31 @@ def select_segmentation_profile(
     if profile == "adaptive_recovery":
         return np.where(adaptive_mask > 0, 255, 0).astype(np.uint8)
 
+    if profile == "hysteresis_recovery":
+        if hysteresis_min_area < 0:
+            raise ValueError(
+                f"hysteresis_min_area must be non-negative, got {hysteresis_min_area}"
+            )
+        hysteresis_mask = binarize_ridge_hysteresis(
+            ridge_norm, low_thresh=hysteresis_low, high_thresh=hysteresis_high
+        )
+        if hysteresis_use_shape_filter:
+            cleaned, _ = filter_crack_components_by_shape(
+                hysteresis_mask,
+                min_area=hysteresis_min_area,
+                large_area_thresh=hysteresis_large_area_thresh,
+                interior_aspect_thresh=hysteresis_interior_aspect_thresh,
+                boundary_aspect_thresh=hysteresis_boundary_aspect_thresh,
+                min_skeleton_length=hysteresis_min_skeleton_length,
+            )
+        else:
+            # Apply component filtering (default min_area=80)
+            cleaned, _ = filter_crack_components(
+                hysteresis_mask, min_area=hysteresis_min_area
+            )
+        return cleaned
+
+    # guided_recovery
     if guided_kernel_size < 1 or guided_kernel_size % 2 == 0:
         raise ValueError("guided_kernel_size must be a positive odd integer")
     ridge_binary = ridge_mask > 0
@@ -259,7 +446,16 @@ def run_segmentation_pipeline(preprocessed_results: dict,
                               min_area: int = 80,
                               fusion_mode: str = "frangi_primary",
                               segmentation_profile: str = "baseline",
-                              save_steps: bool = True) -> dict:
+                              save_steps: bool = True,
+                              *,
+                              hysteresis_low: int = 25,
+                              hysteresis_high: int = 48,
+                              hysteresis_min_area: int | None = None,
+                              hysteresis_use_shape_filter: bool = False,
+                              hysteresis_large_area_thresh: int = 200,
+                              hysteresis_interior_aspect_thresh: float = 2.2,
+                              hysteresis_boundary_aspect_thresh: float = 1.6,
+                              hysteresis_min_skeleton_length: int = 20) -> dict:
     """
     Execute the full Step 2 Segmentation Pipeline on preprocessed results.
     
@@ -301,6 +497,15 @@ def run_segmentation_pipeline(preprocessed_results: dict,
         adaptive_mask,
         profile=segmentation_profile,
         fusion_mode=fusion_mode,
+        ridge_norm=ridge_norm,
+        hysteresis_low=hysteresis_low,
+        hysteresis_high=hysteresis_high,
+        hysteresis_min_area=hysteresis_min_area if hysteresis_min_area is not None else min_area,
+        hysteresis_use_shape_filter=hysteresis_use_shape_filter,
+        hysteresis_large_area_thresh=hysteresis_large_area_thresh,
+        hysteresis_interior_aspect_thresh=hysteresis_interior_aspect_thresh,
+        hysteresis_boundary_aspect_thresh=hysteresis_boundary_aspect_thresh,
+        hysteresis_min_skeleton_length=hysteresis_min_skeleton_length,
     )
         
     # 5. Overlay

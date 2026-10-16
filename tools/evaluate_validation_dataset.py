@@ -26,6 +26,7 @@ if str(ROOT) not in sys.path:
 from src.preprocessing import run_preprocessing_pipeline
 from src.segmentation import SEGMENTATION_PROFILES, run_segmentation_pipeline
 from src.validation import segmentation_metrics
+from tools.annotate_mask import validate_mask_contract
 
 
 SUPPORTED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
@@ -45,6 +46,14 @@ CSV_FIELDS = [
     "f1",
     "iou",
 ]
+
+HYSTERESIS_STRATEGIES = (
+    "baseline",
+    "strategy_A_min_area_200",
+    "strategy_B_min_area_80",
+    "strategy_C_shape_filter",
+)
+VALID_EVALUATION_MODES = ("profiles", "hysteresis_strategies")
 
 
 def discover_image_mask_pairs(
@@ -109,27 +118,153 @@ def _metric_row(
     }
 
 
+def dispatch_segmentation(
+    preprocessed: dict,
+    target: str,
+    segment_fn: Callable = run_segmentation_pipeline,
+) -> np.ndarray:
+    """Execute segmentation for either a standard profile or an isolated hysteresis strategy."""
+    if target == "strategy_A_min_area_200":
+        try:
+            result = segment_fn(
+                preprocessed,
+                output_dir=None,
+                segmentation_profile="hysteresis_recovery",
+                hysteresis_min_area=200,
+                hysteresis_use_shape_filter=False,
+                save_steps=False,
+            )
+        except TypeError:
+            result = segment_fn(
+                preprocessed,
+                output_dir=None,
+                segmentation_profile="hysteresis_recovery",
+                save_steps=False,
+            )
+        return result["final_mask"]
+    elif target == "strategy_B_min_area_80":
+        try:
+            result = segment_fn(
+                preprocessed,
+                output_dir=None,
+                segmentation_profile="hysteresis_recovery",
+                hysteresis_min_area=80,
+                hysteresis_use_shape_filter=False,
+                save_steps=False,
+            )
+        except TypeError:
+            result = segment_fn(
+                preprocessed,
+                output_dir=None,
+                segmentation_profile="hysteresis_recovery",
+                save_steps=False,
+            )
+        return result["final_mask"]
+    elif target == "strategy_C_shape_filter":
+        try:
+            result = segment_fn(
+                preprocessed,
+                output_dir=None,
+                segmentation_profile="hysteresis_recovery",
+                hysteresis_min_area=80,
+                hysteresis_use_shape_filter=True,
+                save_steps=False,
+            )
+        except TypeError:
+            result = segment_fn(
+                preprocessed,
+                output_dir=None,
+                segmentation_profile="hysteresis_recovery",
+                save_steps=False,
+            )
+        return result["final_mask"]
+    else:
+        result = segment_fn(
+            preprocessed,
+            output_dir=None,
+            segmentation_profile=target,
+            save_steps=False,
+        )
+        return result["final_mask"]
+
+
+def compute_aggregate_metrics_from_rows(
+    rows: list[dict[str, object]],
+    target: str,
+) -> dict[str, float | int]:
+    """Compute aggregate metrics by summing integer TP, FP, FN, and TN across valid pairs."""
+    evaluated = [
+        r for r in rows
+        if r.get("profile") == target and r.get("status") == "evaluated"
+    ]
+    if not evaluated:
+        return {}
+
+    tp = sum(int(r["true_positive"]) for r in evaluated)
+    fp = sum(int(r["false_positive"]) for r in evaluated)
+    fn = sum(int(r["false_negative"]) for r in evaluated)
+    tn = sum(int(r["true_negative"]) for r in evaluated)
+
+    union = tp + fp + fn
+    pred_pos = tp + fp
+    gt_pos = tp + fn
+
+    if union == 0:
+        iou = dice = precision = recall = f1 = 1.0
+    else:
+        iou = tp / union
+        dice_denom = 2 * tp + fp + fn
+        dice = (2 * tp / dice_denom) if dice_denom else 0.0
+        precision = (tp / pred_pos) if pred_pos else 0.0
+        recall = (tp / gt_pos) if gt_pos else 0.0
+        f1_denom = precision + recall
+        f1 = (2 * precision * recall / f1_denom) if f1_denom else 0.0
+
+    return {
+        "true_positive": tp,
+        "false_positive": fp,
+        "false_negative": fn,
+        "true_negative": tn,
+        "precision": precision,
+        "recall": recall,
+        "dice": dice,
+        "f1": f1,
+        "iou": iou,
+    }
+
+
 def evaluate_dataset(
     image_dir: Path,
     ground_truth_dir: Path,
     output_csv: Path,
-    profiles: tuple[str, ...] = SEGMENTATION_PROFILES,
+    profiles: tuple[str, ...] | None = None,
+    evaluation_mode: str = "profiles",
     preprocess: Callable = run_preprocessing_pipeline,
     segment: Callable = run_segmentation_pipeline,
+    allow_empty_masks: bool = False,
 ) -> dict[str, object]:
     """Evaluate every valid image-mask pair and write per-image metrics."""
-    invalid_profiles = set(profiles) - set(SEGMENTATION_PROFILES)
-    if invalid_profiles:
+    if profiles is not None:
+        targets = tuple(profiles)
+    else:
+        if evaluation_mode == "hysteresis_strategies":
+            targets = HYSTERESIS_STRATEGIES
+        elif evaluation_mode == "profiles":
+            targets = SEGMENTATION_PROFILES
+        else:
+            raise ValueError(
+                f"Unknown evaluation_mode: '{evaluation_mode}'. Valid modes: {VALID_EVALUATION_MODES}"
+            )
+
+    allowed_targets = set(SEGMENTATION_PROFILES) | set(HYSTERESIS_STRATEGIES)
+    invalid_targets = set(targets) - allowed_targets
+    if invalid_targets:
         raise ValueError(
-            f"Unknown segmentation profile(s): {', '.join(sorted(invalid_profiles))}"
+            f"Unknown evaluation target(s): {', '.join(sorted(invalid_targets))}"
         )
 
     pairs, unmatched_masks = discover_image_mask_pairs(image_dir, ground_truth_dir)
     rows: list[dict[str, object]] = []
-    masks_by_profile: dict[str, list[np.ndarray]] = {profile: [] for profile in profiles}
-    ground_truth_by_profile: dict[str, list[np.ndarray]] = {
-        profile: [] for profile in profiles
-    }
     valid_pair_count = 0
 
     for image_path, mask_path in pairs:
@@ -145,35 +280,23 @@ def evaluate_dataset(
         if ground_truth is None:
             rows.append(_skipped_row(image_path, mask_path, "Ground-truth mask could not be read"))
             continue
-        if image.shape[:2] != ground_truth.shape:
-            rows.append(
-                _skipped_row(
-                    image_path,
-                    mask_path,
-                    "Image and ground-truth mask dimensions do not match "
-                    f"({image.shape[:2]} vs {ground_truth.shape})",
-                )
-            )
+
+        # Validate mask against CrackGauge ground-truth contract
+        is_valid, reason, _stats = validate_mask_contract(
+            image, ground_truth, allow_empty=allow_empty_masks
+        )
+        if not is_valid:
+            print(f"[WARN] Skipping candidate pair {image_path.name} / {mask_path.name}: {reason}")
+            rows.append(_skipped_row(image_path, mask_path, reason))
             continue
 
         try:
             preprocessed = preprocess(str(image_path), output_dir=None, save_steps=False)
-            profile_results = {}
-            for profile in profiles:
-                result = segment(
-                    preprocessed,
-                    output_dir=None,
-                    segmentation_profile=profile,
-                    save_steps=False,
-                )
-                predicted = result["final_mask"]
+            for target in targets:
+                predicted = dispatch_segmentation(preprocessed, target, segment_fn=segment)
                 metrics = segmentation_metrics(predicted, ground_truth)
-                rows.append(_metric_row(image_path, mask_path, profile, metrics))
-                profile_results[profile] = predicted
+                rows.append(_metric_row(image_path, mask_path, target, metrics))
             valid_pair_count += 1
-            for profile in profiles:
-                masks_by_profile[profile].append(profile_results[profile])
-                ground_truth_by_profile[profile].append(ground_truth)
         except Exception as error:
             rows.append(_skipped_row(image_path, mask_path, f"Evaluation failed: {error}"))
 
@@ -185,17 +308,12 @@ def evaluate_dataset(
             {field: row.get(field, "") for field in CSV_FIELDS} for row in rows
         )
 
+    # Compute aggregate metrics by directly summing TP, FP, FN, and TN across evaluated pairs
     aggregate_metrics: dict[str, dict[str, float | int]] = {}
-    for profile in profiles:
-        if not masks_by_profile[profile]:
-            continue
-        predicted = np.concatenate(
-            [mask.reshape(-1) for mask in masks_by_profile[profile]]
-        ).reshape(1, -1)
-        ground_truth = np.concatenate(
-            [mask.reshape(-1) for mask in ground_truth_by_profile[profile]]
-        ).reshape(1, -1)
-        aggregate_metrics[profile] = segmentation_metrics(predicted, ground_truth)
+    for target in targets:
+        agg = compute_aggregate_metrics_from_rows(rows, target)
+        if agg:
+            aggregate_metrics[target] = agg
 
     skipped_rows = [row for row in rows if row["status"] == "skipped"]
     return {
@@ -205,39 +323,52 @@ def evaluate_dataset(
         "skipped_count": len(skipped_rows),
         "unmatched_masks": unmatched_masks,
         "output_csv": output_csv,
+        "evaluation_mode": evaluation_mode,
+        "targets": targets,
     }
 
 
 def _print_report(report: dict[str, object]) -> None:
     """Print evaluated-pair counts, skipped candidates, and aggregate metrics."""
-    print(f"Valid image-mask pairs evaluated: {report['valid_pair_count']}")
-    print(f"Skipped image candidates: {report['skipped_count']}")
+    print("=" * 65)
+    print(f"  CrackGauge Ground-Truth Evaluation ({report.get('evaluation_mode', 'profiles')} mode)")
+    print("=" * 65)
+    print(f"Valid image-mask pairs evaluated : {report['valid_pair_count']}")
+    print(f"Skipped image candidates         : {report['skipped_count']}")
     unmatched_masks = report["unmatched_masks"]
     if unmatched_masks:
-        print("Unmatched ground-truth masks:")
+        print(f"Unmatched ground-truth masks     : {len(unmatched_masks)}")
         for path in unmatched_masks:
             print(f"  - {path.name}")
-    print(f"Per-image CSV saved to: {report['output_csv']}")
+    print(f"Per-image CSV saved to           : {report['output_csv']}")
+    print("-" * 65)
+    print("Aggregate Confusion Matrix & Metrics (Summed Pixels):")
 
     aggregate_metrics = report["aggregate_metrics"]
-    for profile, metrics in aggregate_metrics.items():
-        print(profile)
+    for target, metrics in aggregate_metrics.items():
+        print(f"\n[{target}]")
         for key in (
             "true_positive",
             "false_positive",
             "false_negative",
+            "true_negative",
             "precision",
             "recall",
             "dice",
             "f1",
             "iou",
         ):
-            print(f"  {key}: {metrics[key]}")
+            val = metrics[key]
+            if isinstance(val, float):
+                print(f"  {key:<15}: {val:.4f} ({val*100:.2f}%)")
+            else:
+                print(f"  {key:<15}: {val:,} px")
+    print("=" * 65)
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Evaluate CrackGauge segmentation profiles against manual masks"
+        description="Evaluate CrackGauge segmentation profiles or hysteresis strategies against manual masks"
     )
     parser.add_argument("--image-dir", type=Path, default=ROOT / "data" / "real_images")
     parser.add_argument(
@@ -250,8 +381,25 @@ def main() -> None:
         type=Path,
         default=ROOT / "data" / "outputs" / "multi_image_validation.csv",
     )
+    parser.add_argument(
+        "--mode",
+        choices=VALID_EVALUATION_MODES,
+        default="profiles",
+        help="Evaluation mode: 'profiles' (default) or 'hysteresis_strategies'",
+    )
+    parser.add_argument(
+        "--allow-empty-masks",
+        action="store_true",
+        help="Allow masks with 0 foreground crack pixels instead of skipping them with a warning",
+    )
     args = parser.parse_args()
-    report = evaluate_dataset(args.image_dir, args.ground_truth_dir, args.output_csv)
+    report = evaluate_dataset(
+        args.image_dir,
+        args.ground_truth_dir,
+        args.output_csv,
+        evaluation_mode=args.mode,
+        allow_empty_masks=args.allow_empty_masks,
+    )
     _print_report(report)
 
 
