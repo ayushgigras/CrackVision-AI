@@ -7,6 +7,7 @@ from src.measurement import measure_crack_lengths, compute_skeleton
 class TestCrackLength(unittest.TestCase):
 
     def test_empty_crack_mask(self):
+        """An empty mask should have zero length and zero components."""
         mask = np.zeros((100, 100), dtype=np.uint8)
 
         result = measure_crack_lengths(mask)
@@ -15,6 +16,7 @@ class TestCrackLength(unittest.TestCase):
         self.assertEqual(result["component_count"], 0)
 
     def test_horizontal_line_length(self):
+        """Automatically skeletonized horizontal crack should have positive length."""
         mask = np.zeros((100, 100), dtype=np.uint8)
         mask[49:52, 10:90] = 255
 
@@ -25,24 +27,21 @@ class TestCrackLength(unittest.TestCase):
 
         measured = result["total_length_px"]
 
-        print("\n--- Horizontal Crack Evaluation ---")
-        print(f"Measured length: {measured:.2f} px")
-
-        self.assertGreater(measured, 0)
+        self.assertGreater(measured, 0.0)
 
     def test_vertical_line_length(self):
+        """Automatically skeletonized vertical crack should have positive length."""
         mask = np.zeros((100, 100), dtype=np.uint8)
         mask[10:90, 49:52] = 255
 
-        # Inspect the automatically generated skeleton.
         skeleton = compute_skeleton(mask)
 
         ys, xs = np.where(skeleton > 0)
 
-        print("\n--- Vertical Skeleton Debug ---")
-        print(f"Skeleton pixels: {len(xs)}")
-        print(f"Y range: {ys.min()} to {ys.max()}")
-        print(f"X range: {xs.min()} to {xs.max()}")
+        # The generated skeleton should be non-empty and vertical.
+        self.assertGreater(len(xs), 0)
+        self.assertTrue(np.all(xs == 50))
+        self.assertEqual(len(np.unique(ys)), len(ys))
 
         result = measure_crack_lengths(
             mask,
@@ -52,12 +51,12 @@ class TestCrackLength(unittest.TestCase):
 
         measured = result["total_length_px"]
 
-        print("\n--- Vertical Crack Evaluation ---")
-        print(f"Measured length: {measured:.2f} px")
-
-        self.assertGreater(measured, 0)
+        # A continuous straight path of N pixels has N - 1 pixel steps.
+        expected_length = float(len(ys) - 1)
+        self.assertAlmostEqual(measured, expected_length, places=2)
 
     def test_horizontal_known_skeleton_length(self):
+        """A supplied horizontal skeleton should measure exactly 79 pixels."""
         mask = np.zeros((100, 100), dtype=np.uint8)
         mask[49:52, 10:90] = 255
 
@@ -72,13 +71,10 @@ class TestCrackLength(unittest.TestCase):
 
         measured = result["total_length_px"]
 
-        print("\n--- Known Horizontal Skeleton ---")
-        print("Expected: 79.00 px")
-        print(f"Measured: {measured:.2f} px")
-
         self.assertAlmostEqual(measured, 79.0, places=2)
 
     def test_vertical_known_skeleton_length(self):
+        """A supplied vertical skeleton should measure exactly 79 pixels."""
         mask = np.zeros((100, 100), dtype=np.uint8)
         mask[10:90, 49:52] = 255
 
@@ -92,10 +88,6 @@ class TestCrackLength(unittest.TestCase):
         )
 
         measured = result["total_length_px"]
-
-        print("\n--- Known Vertical Skeleton ---")
-        print("Expected: 79.00 px")
-        print(f"Measured: {measured:.2f} px")
 
         self.assertAlmostEqual(measured, 79.0, places=2)
 
