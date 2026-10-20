@@ -26,7 +26,9 @@ import io
 import logging
 import os
 import sys
-from typing import Annotated, Optional
+import uuid
+from datetime import datetime, timezone
+from typing import Annotated, Any, Dict, Optional
 
 import cv2
 import numpy as np
@@ -37,18 +39,24 @@ _project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _project_root not in sys.path:
     sys.path.insert(0, _project_root)
 
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile, status
+from fastapi import Body, FastAPI, File, Form, Header, HTTPException, Query, Response, UploadFile, status
 from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from src import __version__
+from src.db import delete_analysis, get_analysis, list_analyses, save_analysis
 from src.pipeline_service import (
     PipelineConfig,
     _SUPPORTED_ARUCO_DICTS,
     _SUPPORTED_BIN_METHODS,
     _SUPPORTED_PROFILES,
     analyze_image_array,
+)
+from src.report import (
+    generate_analysis_csv,
+    generate_history_csv,
+    generate_pdf_report,
 )
 from src.segmentation import SEGMENTATION_PROFILES
 
@@ -317,6 +325,10 @@ async def analyze(
         str,
         Form(description=f"ArUco dictionary name. One of: {', '.join(_SUPPORTED_ARUCO_DICTS)}"),
     ] = "DICT_4X4_50",
+    x_client_id: Annotated[
+        Optional[str],
+        Header(description="Optional client / operator identifier for history ownership"),
+    ] = None,
 ) -> JSONResponse:
     """Upload a concrete-surface image and receive crack measurements.
 
@@ -328,6 +340,7 @@ async def analyze(
     4A. Length measurement (skeleton path traversal with optional gap-closing)
     4B. Orientation measurement (PCA on crack pixels)
     5. Calibration (ArUco marker or manual scale → mm conversion)
+    6. Persistence (Save analysis metadata and results to SQLite history)
 
     **Response**
 
@@ -403,4 +416,220 @@ async def analyze(
             },
         ) from exc
 
+    # 6. Assign persistent identity and save to SQLite history
+    analysis_id = uuid.uuid4().hex
+    timestamp = datetime.now(timezone.utc).isoformat()
+    result["analysis_id"] = analysis_id
+    result["timestamp"] = timestamp
+    result["segmentation_profile"] = segmentation_profile
+
+    try:
+        save_analysis(result, client_id=x_client_id or "default")
+    except Exception as exc:
+        logger.warning("Could not persist analysis %s to SQLite: %s", analysis_id, exc)
+
     return JSONResponse(content=result)
+
+
+# ---------------------------------------------------------------------------
+# History & Reporting Endpoints
+# ---------------------------------------------------------------------------
+
+@app.get(
+    "/api/history",
+    summary="List analysis history",
+    tags=["History"],
+)
+async def get_history(
+    limit: Annotated[int, Query(description="Maximum records to return", ge=1, le=200)] = 50,
+    offset: Annotated[int, Query(description="Number of records to skip", ge=0)] = 0,
+    x_client_id: Annotated[Optional[str], Header()] = None,
+) -> dict:
+    """Return past analysis records without heavy base64 visual blobs."""
+    try:
+        items, total = list_analyses(client_id=x_client_id, limit=limit, offset=offset)
+        return {"analyses": items, "total": total, "limit": limit, "offset": offset}
+    except Exception as exc:
+        logger.exception("Failed to query analysis history: %s", exc)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail={"error": "history_query_failed", "message": str(exc)},
+        ) from exc
+
+
+@app.get(
+    "/api/history/export/csv",
+    summary="Export all analysis history as CSV",
+    tags=["Reporting"],
+)
+async def export_all_history_csv(
+    x_client_id: Annotated[Optional[str], Header()] = None,
+) -> Response:
+    """Export summary metrics of all saved analyses as a combined CSV spreadsheet."""
+    items, _ = list_analyses(client_id=x_client_id, limit=200)
+    csv_content = generate_history_csv(items)
+    return Response(
+        content=csv_content,
+        media_type="text/csv",
+        headers={"Content-Disposition": 'attachment; filename="crackgauge_history.csv"'},
+    )
+
+
+@app.get(
+    "/api/history/{analysis_id}",
+    summary="Get full analysis record by ID",
+    tags=["History"],
+)
+async def get_history_item(
+    analysis_id: str,
+    x_client_id: Annotated[Optional[str], Header()] = None,
+) -> dict:
+    """Retrieve full analysis result including base64 visual overlays."""
+    try:
+        record = get_analysis(analysis_id, client_id=x_client_id)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={"error": "invalid_id", "message": str(exc)},
+        ) from exc
+    except Exception as exc:
+        logger.exception("Failed to fetch analysis %s: %s", analysis_id, exc)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail={"error": "fetch_failed", "message": str(exc)},
+        ) from exc
+
+    if not record:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={"error": "not_found", "message": f"Analysis '{analysis_id}' not found."},
+        )
+    return record
+
+
+@app.delete(
+    "/api/history/{analysis_id}",
+    summary="Delete an analysis record",
+    tags=["History"],
+)
+async def delete_history_item(
+    analysis_id: str,
+    x_client_id: Annotated[Optional[str], Header()] = None,
+) -> dict:
+    """Safely delete an analysis record from persistent history."""
+    try:
+        deleted = delete_analysis(analysis_id, client_id=x_client_id)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={"error": "invalid_id", "message": str(exc)},
+        ) from exc
+    except Exception as exc:
+        logger.exception("Failed to delete analysis %s: %s", analysis_id, exc)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail={"error": "delete_failed", "message": str(exc)},
+        ) from exc
+
+    if not deleted:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={"error": "not_found", "message": f"Analysis '{analysis_id}' not found."},
+        )
+    return {"deleted": True, "analysis_id": analysis_id}
+
+
+@app.get(
+    "/api/history/{analysis_id}/pdf",
+    summary="Download PDF report for an existing analysis",
+    tags=["Reporting"],
+)
+async def download_history_pdf(
+    analysis_id: str,
+    x_client_id: Annotated[Optional[str], Header()] = None,
+) -> Response:
+    """Generate and download a professional PDF inspection report."""
+    try:
+        record = get_analysis(analysis_id, client_id=x_client_id)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail={"error": "fetch_failed", "message": str(exc)},
+        ) from exc
+
+    if not record:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={"error": "not_found", "message": f"Analysis '{analysis_id}' not found."},
+        )
+
+    try:
+        pdf_bytes = await run_in_threadpool(generate_pdf_report, record)
+    except Exception as exc:
+        logger.exception("Failed to generate PDF for %s: %s", analysis_id, exc)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail={"error": "pdf_generation_failed", "message": str(exc)},
+        ) from exc
+
+    filename = f"crackgauge_report_{record.get('image_name', analysis_id)}.pdf"
+    return Response(
+        content=pdf_bytes,
+        media_type="application/pdf",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+@app.post(
+    "/api/report/pdf",
+    summary="Generate PDF report from current analysis payload",
+    tags=["Reporting"],
+)
+async def generate_pdf_from_payload(
+    payload: Annotated[Dict[str, Any], Body(description="Full analysis JSON payload")],
+) -> Response:
+    """Generate a PDF report directly from the current analysis payload."""
+    try:
+        pdf_bytes = await run_in_threadpool(generate_pdf_report, payload)
+    except Exception as exc:
+        logger.exception("Failed to generate PDF from payload: %s", exc)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail={"error": "pdf_generation_failed", "message": str(exc)},
+        ) from exc
+
+    safe_name = payload.get("image_name") or payload.get("analysis_id") or "scan"
+    filename = f"crackgauge_report_{safe_name}.pdf"
+    return Response(
+        content=pdf_bytes,
+        media_type="application/pdf",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+@app.get(
+    "/api/history/{analysis_id}/csv",
+    summary="Download CSV for an analysis record",
+    tags=["Reporting"],
+)
+async def download_history_csv(
+    analysis_id: str,
+    x_client_id: Annotated[Optional[str], Header()] = None,
+) -> Response:
+    """Export quantitative measurement values for an analysis as CSV."""
+    record = get_analysis(analysis_id, client_id=x_client_id)
+    if not record:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={"error": "not_found", "message": f"Analysis '{analysis_id}' not found."},
+        )
+
+    csv_content = generate_analysis_csv(record)
+    filename = f"crackgauge_{record.get('image_name', analysis_id)}_measurements.csv"
+    return Response(
+        content=csv_content,
+        media_type="text/csv",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
